@@ -452,11 +452,11 @@ jobs:
           }
 
           @"
-XboxWine Shelf v0.2.7.0
-Official SDL2 UWP / Direct3D 11 recovery build
-GitHub run: $env:GITHUB_RUN_NUMBER
-Commit: $env:GITHUB_SHA
-"@ | Set-Content `
+          XboxWine Shelf v0.2.7.0
+          Official SDL2 UWP / Direct3D 11 recovery build
+          GitHub run: $env:GITHUB_RUN_NUMBER
+          Commit: $env:GITHUB_SHA
+          "@ | Set-Content `
               (Join-Path $packageFolder "THIS-IS-XBOXWINE-v0.2.7.txt") `
               -Encoding UTF8
 
