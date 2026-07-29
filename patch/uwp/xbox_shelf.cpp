@@ -230,6 +230,7 @@ bool TryLoadGame(
         ).get();
         entry.nativeRoot = to_string(writableRoot.Path());
         entry.wineExecutable = read("exe", "");
+        entry.architecture = Lower(read("architecture", "unknown"));
         if (entry.wineExecutable.empty()) {
             reason = "NO EXECUTABLE WAS SELECTED FOR " + Upper(entry.title);
             return false;
@@ -361,6 +362,7 @@ bool SaveGame(GameEntry& game, std::string& diagnostic) {
         manifest << "title=" << game.title << "\n";
         manifest << "zip=game.zip\n";
         manifest << "exe=" << game.wineExecutable << "\n";
+        manifest << "architecture=" << game.architecture << "\n";
         manifest << "candidate_exes="
                  << JoinList(game.executableCandidates, '|') << "\n";
         manifest << "detected_keys=" << JoinList(game.detectedKeys, ',') << "\n";
@@ -878,6 +880,74 @@ void ShowTransferScreen(SDL_Renderer* renderer) {
 
 } // namespace
 
+
+enum class ShelfScreen {
+    Home,
+    Library,
+    About
+};
+
+std::string ArchitectureLabel(const GameEntry& game) {
+    const std::string value = Lower(game.architecture);
+    if (value == "x86") {
+        return "32-BIT X86";
+    }
+    if (value == "x64" || value == "amd64") {
+        return "64-BIT X64";
+    }
+    if (value == "arm64") {
+        return "ARM64";
+    }
+    return "ARCH UNKNOWN";
+}
+
+bool Is64BitGame(const GameEntry& game) {
+    const std::string value = Lower(game.architecture);
+    return value == "x64" || value == "amd64";
+}
+
+void FillRect(
+    SDL_Renderer* renderer,
+    const SDL_Rect& rect,
+    SDL_Color color
+) {
+    SDL_SetRenderDrawColor(renderer, color.r, color.g, color.b, color.a);
+    SDL_RenderFillRect(renderer, &rect);
+}
+
+void StrokeRect(
+    SDL_Renderer* renderer,
+    const SDL_Rect& rect,
+    SDL_Color color,
+    int thickness = 2
+) {
+    SDL_SetRenderDrawColor(renderer, color.r, color.g, color.b, color.a);
+    for (int index = 0; index < thickness; ++index) {
+        SDL_Rect line{
+            rect.x + index,
+            rect.y + index,
+            rect.w - index * 2,
+            rect.h - index * 2
+        };
+        SDL_RenderDrawRect(renderer, &line);
+    }
+}
+
+void DrawButtonHint(
+    SDL_Renderer* renderer,
+    int x,
+    int y,
+    const std::string& button,
+    const std::string& action,
+    SDL_Color accent,
+    SDL_Color text
+) {
+    SDL_Rect key{x, y, 38, 30};
+    FillRect(renderer, key, accent);
+    DrawText(renderer, x + 11, y + 8, button, 2, SDL_Color{7, 17, 28, 255});
+    DrawText(renderer, x + 50, y + 8, action, 2, text);
+}
+
 std::map<std::string, std::string> DefaultControllerBindings() {
     return {
         {"A", "SPACE"}, {"B", "ESCAPE"},
@@ -897,36 +967,48 @@ std::map<std::string, std::string> DefaultControllerBindings() {
 
 bool PickGame(GameEntry& selected, std::string& diagnostic) {
     SDL_SetHint(SDL_HINT_RENDER_DRIVER, "direct3d11");
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER | SDL_INIT_EVENTS) != 0) {
+
+    if (SDL_Init(
+            SDL_INIT_VIDEO |
+            SDL_INIT_GAMECONTROLLER |
+            SDL_INIT_EVENTS
+        ) != 0) {
         diagnostic = SDL_GetError();
         return false;
     }
 
     SDL_Window* window = SDL_CreateWindow(
-        "XboxWine Shelf",
+        "XboxWine",
         SDL_WINDOWPOS_CENTERED,
         SDL_WINDOWPOS_CENTERED,
         1280,
         720,
         SDL_WINDOW_FULLSCREEN_DESKTOP
     );
+
     if (!window) {
         diagnostic = SDL_GetError();
         return false;
     }
+
     SDL_Renderer* renderer = SDL_CreateRenderer(
         window,
         -1,
         SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC
     );
+
     if (!renderer) {
         renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
     }
+
     if (!renderer) {
         diagnostic = SDL_GetError();
         SDL_DestroyWindow(window);
         return false;
     }
+
+    SDL_RenderSetLogicalSize(renderer, 1280, 720);
+    SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
 
     SDL_GameController* menuController = nullptr;
     for (int index = 0; index < SDL_NumJoysticks(); ++index) {
@@ -939,194 +1021,525 @@ bool PickGame(GameEntry& selected, std::string& diagnostic) {
     }
 
     StartTransferServer();
+
     std::vector<GameEntry> games = ScanGames(diagnostic);
-    int selection = 0;
+    ShelfScreen screen = ShelfScreen::Home;
+    int homeSelection = 0;
+    int gameSelection = 0;
     bool running = true;
     bool accepted = false;
     Uint32 lastMove = 0;
 
+    const std::array<std::string, 3> homeItems{
+        "MY LIBRARY",
+        "ADD A GAME",
+        "SYSTEM STATUS"
+    };
+
     while (running) {
         SDL_Event event{};
+
         while (SDL_PollEvent(&event)) {
             if (event.type == SDL_QUIT) {
                 running = false;
             }
+
             if (event.type == SDL_CONTROLLERDEVICEADDED && !menuController) {
                 menuController = SDL_GameControllerOpen(event.cdevice.which);
             }
 
             const Uint32 now = SDL_GetTicks();
             const bool canMove = now - lastMove > 150;
-            if ((event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_UP) ||
-                ControllerPressed(event, SDL_CONTROLLER_BUTTON_DPAD_UP)) {
-                if (canMove && !games.empty()) {
-                    selection = (selection - 1 + static_cast<int>(games.size())) %
-                                static_cast<int>(games.size());
+
+            const bool up =
+                (event.type == SDL_KEYDOWN &&
+                 event.key.keysym.sym == SDLK_UP) ||
+                ControllerPressed(event, SDL_CONTROLLER_BUTTON_DPAD_UP);
+
+            const bool down =
+                (event.type == SDL_KEYDOWN &&
+                 event.key.keysym.sym == SDLK_DOWN) ||
+                ControllerPressed(event, SDL_CONTROLLER_BUTTON_DPAD_DOWN);
+
+            const bool confirm =
+                (event.type == SDL_KEYDOWN &&
+                 event.key.keysym.sym == SDLK_RETURN) ||
+                ControllerPressed(event, SDL_CONTROLLER_BUTTON_A);
+
+            const bool back =
+                (event.type == SDL_KEYDOWN &&
+                 event.key.keysym.sym == SDLK_ESCAPE) ||
+                ControllerPressed(event, SDL_CONTROLLER_BUTTON_B);
+
+            if (screen == ShelfScreen::Home) {
+                if (up && canMove) {
+                    homeSelection =
+                        (homeSelection - 1 +
+                         static_cast<int>(homeItems.size())) %
+                        static_cast<int>(homeItems.size());
                     lastMove = now;
                 }
-            }
-            if ((event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_DOWN) ||
-                ControllerPressed(event, SDL_CONTROLLER_BUTTON_DPAD_DOWN)) {
-                if (canMove && !games.empty()) {
-                    selection = (selection + 1) % static_cast<int>(games.size());
+
+                if (down && canMove) {
+                    homeSelection =
+                        (homeSelection + 1) %
+                        static_cast<int>(homeItems.size());
                     lastMove = now;
                 }
+
+                if (confirm) {
+                    if (homeSelection == 0) {
+                        screen = ShelfScreen::Library;
+                    } else if (homeSelection == 1) {
+                        ShowTransferScreen(renderer);
+                        games = ScanGames(diagnostic);
+                        gameSelection = 0;
+                    } else {
+                        screen = ShelfScreen::About;
+                    }
+                }
+
+                if (back) {
+                    running = false;
+                }
+
+                continue;
             }
-            if ((event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_RETURN) ||
-                ControllerPressed(event, SDL_CONTROLLER_BUTTON_A)) {
-                if (!games.empty()) {
-                    selected = games[selection];
+
+            if (screen == ShelfScreen::About) {
+                if (back || confirm) {
+                    screen = ShelfScreen::Home;
+                }
+                continue;
+            }
+
+            if (up && canMove && !games.empty()) {
+                gameSelection =
+                    (gameSelection - 1 + static_cast<int>(games.size())) %
+                    static_cast<int>(games.size());
+                lastMove = now;
+            }
+
+            if (down && canMove && !games.empty()) {
+                gameSelection =
+                    (gameSelection + 1) %
+                    static_cast<int>(games.size());
+                lastMove = now;
+            }
+
+            if (confirm && !games.empty()) {
+                if (Is64BitGame(games[gameSelection])) {
+                    diagnostic =
+                        "64-BIT GAME DETECTED - XBOXWINE64 IS NOT READY YET";
+                } else {
+                    selected = games[gameSelection];
                     accepted = true;
                     running = false;
                 }
             }
-            if ((event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_x) ||
-                ControllerPressed(event, SDL_CONTROLLER_BUTTON_X)) {
-                if (!games.empty()) {
-                    EditControls(renderer, games[selection], diagnostic);
-                }
+
+            if (
+                ((event.type == SDL_KEYDOWN &&
+                  event.key.keysym.sym == SDLK_x) ||
+                 ControllerPressed(event, SDL_CONTROLLER_BUTTON_X)) &&
+                !games.empty()
+            ) {
+                EditControls(renderer, games[gameSelection], diagnostic);
             }
-            if ((event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_TAB) ||
-                ControllerPressed(event, SDL_CONTROLLER_BUTTON_BACK)) {
-                if (!games.empty()) {
-                    CycleExecutable(games[selection], diagnostic);
-                }
+
+            if (
+                ((event.type == SDL_KEYDOWN &&
+                  event.key.keysym.sym == SDLK_TAB) ||
+                 ControllerPressed(event, SDL_CONTROLLER_BUTTON_BACK)) &&
+                !games.empty()
+            ) {
+                CycleExecutable(games[gameSelection], diagnostic);
             }
-            if ((event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_y) ||
-                ControllerPressed(event, SDL_CONTROLLER_BUTTON_Y)) {
+
+            if (
+                (event.type == SDL_KEYDOWN &&
+                 event.key.keysym.sym == SDLK_y) ||
+                ControllerPressed(event, SDL_CONTROLLER_BUTTON_Y)
+            ) {
                 ShowTransferScreen(renderer);
                 games = ScanGames(diagnostic);
-                selection = 0;
+                gameSelection = 0;
             }
-            if ((event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_r)) {
+
+            if (
+                event.type == SDL_KEYDOWN &&
+                event.key.keysym.sym == SDLK_r
+            ) {
                 games = ScanGames(diagnostic);
-                selection = 0;
+                gameSelection = 0;
             }
-            if ((event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_ESCAPE) ||
-                ControllerPressed(event, SDL_CONTROLLER_BUTTON_B)) {
-                running = false;
+
+            if (back) {
+                // B leaves the Library, not the entire application.
+                screen = ShelfScreen::Home;
             }
         }
 
-        if (menuController && !games.empty()) {
+        if (menuController) {
             const Sint16 axis = SDL_GameControllerGetAxis(
                 menuController,
                 SDL_CONTROLLER_AXIS_LEFTY
             );
             const Uint32 now = SDL_GetTicks();
+
             if (now - lastMove > 220) {
-                if (axis < -16000) {
-                    selection = (selection - 1 + static_cast<int>(games.size())) %
-                                static_cast<int>(games.size());
-                    lastMove = now;
-                } else if (axis > 16000) {
-                    selection = (selection + 1) % static_cast<int>(games.size());
-                    lastMove = now;
+                if (screen == ShelfScreen::Home) {
+                    if (axis < -16000) {
+                        homeSelection =
+                            (homeSelection - 1 +
+                             static_cast<int>(homeItems.size())) %
+                            static_cast<int>(homeItems.size());
+                        lastMove = now;
+                    } else if (axis > 16000) {
+                        homeSelection =
+                            (homeSelection + 1) %
+                            static_cast<int>(homeItems.size());
+                        lastMove = now;
+                    }
+                } else if (
+                    screen == ShelfScreen::Library &&
+                    !games.empty()
+                ) {
+                    if (axis < -16000) {
+                        gameSelection =
+                            (gameSelection - 1 +
+                             static_cast<int>(games.size())) %
+                            static_cast<int>(games.size());
+                        lastMove = now;
+                    } else if (axis > 16000) {
+                        gameSelection =
+                            (gameSelection + 1) %
+                            static_cast<int>(games.size());
+                        lastMove = now;
+                    }
                 }
             }
         }
 
-        SDL_SetRenderDrawColor(renderer, 10, 14, 22, 255);
-        SDL_RenderClear(renderer);
-        SDL_Color white{235, 240, 248, 255};
-        SDL_Color muted{145, 158, 178, 255};
-        SDL_Color accent{54, 166, 255, 255};
-        SDL_Color dark{20, 28, 42, 255};
+        const SDL_Color background{7, 11, 18, 255};
+        const SDL_Color panel{17, 25, 38, 255};
+        const SDL_Color panelSoft{23, 34, 50, 255};
+        const SDL_Color white{239, 244, 251, 255};
+        const SDL_Color muted{144, 159, 180, 255};
+        const SDL_Color accent{54, 166, 255, 255};
+        const SDL_Color accentSoft{34, 88, 126, 255};
+        const SDL_Color warning{255, 191, 71, 255};
+        const SDL_Color good{78, 214, 132, 255};
 
-        DrawText(renderer, 48, 38, "XBOXWINE SHELF", 5, white);
+        SDL_SetRenderDrawColor(
+            renderer,
+            background.r,
+            background.g,
+            background.b,
+            255
+        );
+        SDL_RenderClear(renderer);
+
+        // Header bar.
+        SDL_Rect header{0, 0, 1280, 104};
+        FillRect(renderer, header, panel);
+        SDL_Rect accentLine{0, 101, 1280, 3};
+        FillRect(renderer, accentLine, accent);
+
+        DrawText(renderer, 42, 28, "XBOXWINE", 5, white);
         DrawText(
             renderer,
-            50,
-            88,
-            "GAMES ARE STORED ON THE XBOX - NO USB OR PC NEEDED AFTER IMPORT",
+            44,
+            73,
+            "LOCAL WINDOWS APPS ON XBOX",
             2,
             muted
         );
 
-        const int listTop = 135;
-        const int itemHeight = 67;
-        const int visible = 7;
-        int first = std::max(0, selection - visible + 1);
-        if (selection < first) {
-            first = selection;
-        }
-        for (int row = 0; row < visible; ++row) {
-            const int gameIndex = first + row;
-            if (gameIndex >= static_cast<int>(games.size())) {
-                break;
-            }
-            SDL_Rect item{48, listTop + row * itemHeight, 820, 54};
-            if (gameIndex == selection) {
-                SDL_SetRenderDrawColor(
-                    renderer, accent.r, accent.g, accent.b, 255
-                );
-            } else {
-                SDL_SetRenderDrawColor(renderer, dark.r, dark.g, dark.b, 255);
-            }
-            SDL_RenderFillRect(renderer, &item);
-            const SDL_Color textColor = gameIndex == selection
-                ? SDL_Color{5, 14, 24, 255} : white;
+        if (screen == ShelfScreen::Home) {
+            DrawText(renderer, 52, 138, "HOME", 3, muted);
             DrawText(
                 renderer,
-                item.x + 18,
-                item.y + 16,
-                Shorten(games[gameIndex].title, 44),
-                3,
-                textColor
-            );
-        }
-
-        SDL_Rect detail{900, 135, 330, 460};
-        SDL_SetRenderDrawColor(renderer, dark.r, dark.g, dark.b, 255);
-        SDL_RenderFillRect(renderer, &detail);
-        if (!games.empty()) {
-            const GameEntry& game = games[selection];
-            DrawText(renderer, 925, 165, "SELECTED", 2, muted);
-            DrawText(renderer, 925, 205, Shorten(game.title, 25), 3, white);
-            DrawText(renderer, 925, 280, "EXECUTABLE", 2, muted);
-            DrawText(
-                renderer,
-                925,
-                315,
-                Shorten(game.wineExecutable, 28),
-                2,
-                white
-            );
-            DrawText(renderer, 925, 380, "KEYS DETECTED", 2, muted);
-            DrawText(
-                renderer,
-                925,
-                415,
-                std::to_string(game.detectedKeys.size()),
+                52,
+                180,
+                "WHAT DO YOU WANT TO DO?",
                 4,
                 white
             );
-            DrawText(renderer, 925, 490, "A  PLAY", 3, accent);
-            DrawText(renderer, 925, 535, "X  CONTROLS", 2, accent);
-            DrawText(renderer, 925, 570, "VIEW  NEXT EXE", 2, accent);
+
+            for (int index = 0; index < 3; ++index) {
+                SDL_Rect card{
+                    52,
+                    252 + index * 106,
+                    720,
+                    82
+                };
+
+                const bool chosen = index == homeSelection;
+                FillRect(
+                    renderer,
+                    card,
+                    chosen ? accent : panelSoft
+                );
+
+                if (!chosen) {
+                    StrokeRect(renderer, card, accentSoft, 2);
+                }
+
+                const SDL_Color labelColor = chosen
+                    ? SDL_Color{5, 16, 27, 255}
+                    : white;
+
+                DrawText(
+                    renderer,
+                    card.x + 26,
+                    card.y + 27,
+                    homeItems[index],
+                    3,
+                    labelColor
+                );
+
+                DrawText(
+                    renderer,
+                    card.x + 620,
+                    card.y + 27,
+                    index == 0 ? "A" : (index == 1 ? "Y" : "?"),
+                    3,
+                    labelColor
+                );
+            }
+
+            SDL_Rect status{820, 180, 400, 390};
+            FillRect(renderer, status, panel);
+            StrokeRect(renderer, status, accentSoft, 2);
+
+            DrawText(renderer, 850, 212, "QUICK STATUS", 3, white);
+            DrawText(renderer, 850, 274, "INSTALLED ITEMS", 2, muted);
+            DrawText(
+                renderer,
+                850,
+                310,
+                std::to_string(games.size()),
+                5,
+                accent
+            );
+
+            DrawText(renderer, 850, 390, "WINDOWS ENGINE", 2, muted);
+            DrawText(renderer, 850, 427, "BOXEDWINE 32", 3, good);
+
+            DrawText(renderer, 850, 486, "64-BIT ENGINE", 2, muted);
+            DrawText(renderer, 850, 523, "NOT READY", 3, warning);
+
+            DrawButtonHint(
+                renderer,
+                52,
+                650,
+                "A",
+                "SELECT",
+                accent,
+                white
+            );
+            DrawButtonHint(
+                renderer,
+                260,
+                650,
+                "B",
+                "EXIT APP",
+                panelSoft,
+                white
+            );
+        } else if (screen == ShelfScreen::About) {
+            DrawText(renderer, 52, 145, "SYSTEM STATUS", 4, white);
+
+            SDL_Rect status{52, 210, 1170, 370};
+            FillRect(renderer, status, panel);
+            StrokeRect(renderer, status, accentSoft, 2);
+
+            DrawText(renderer, 84, 246, "CURRENT ENGINE", 2, muted);
+            DrawText(renderer, 84, 284, "BOXEDWINE / WINE 32-BIT", 3, white);
+
+            DrawText(renderer, 84, 350, "SUPPORTED NOW", 2, muted);
+            DrawText(
+                renderer,
+                84,
+                386,
+                "PORTABLE 16-BIT AND 32-BIT WINDOWS PROGRAMS",
+                3,
+                good
+            );
+
+            DrawText(renderer, 84, 452, "EXPERIMENTAL ROADMAP", 2, muted);
+            DrawText(
+                renderer,
+                84,
+                488,
+                "XBOXWINE64 - RUNTIME PACKS - KINECT LAB - EMULATOR ENGINES",
+                2,
+                warning
+            );
+
+            DrawButtonHint(
+                renderer,
+                52,
+                650,
+                "B",
+                "BACK TO HOME",
+                panelSoft,
+                white
+            );
         } else {
-            DrawText(renderer, 925, 170, "NO GAMES", 3, white);
-            DrawText(renderer, 925, 230, "PRESS Y", 3, accent);
-            DrawText(renderer, 925, 275, "TO ADD A FOLDER", 2, white);
+            DrawText(renderer, 42, 126, "MY LIBRARY", 4, white);
+            DrawText(
+                renderer,
+                44,
+                170,
+                "A SELECTED ITEM WILL ONLY LAUNCH WHEN ITS ENGINE IS SUPPORTED",
+                2,
+                muted
+            );
+
+            const int listTop = 218;
+            const int itemHeight = 72;
+            const int visible = 6;
+            int first = std::max(0, gameSelection - visible + 1);
+
+            for (int row = 0; row < visible; ++row) {
+                const int gameIndex = first + row;
+                if (gameIndex >= static_cast<int>(games.size())) {
+                    break;
+                }
+
+                const bool chosen = gameIndex == gameSelection;
+                SDL_Rect card{
+                    42,
+                    listTop + row * itemHeight,
+                    760,
+                    58
+                };
+
+                FillRect(
+                    renderer,
+                    card,
+                    chosen ? accent : panelSoft
+                );
+
+                if (!chosen) {
+                    StrokeRect(renderer, card, accentSoft, 1);
+                }
+
+                const SDL_Color itemText = chosen
+                    ? SDL_Color{5, 15, 26, 255}
+                    : white;
+
+                DrawText(
+                    renderer,
+                    card.x + 18,
+                    card.y + 11,
+                    Shorten(games[gameIndex].title, 38),
+                    3,
+                    itemText
+                );
+
+                DrawText(
+                    renderer,
+                    card.x + 550,
+                    card.y + 20,
+                    Is64BitGame(games[gameIndex])
+                        ? "X64"
+                        : "X86",
+                    2,
+                    chosen
+                        ? SDL_Color{5, 15, 26, 255}
+                        : (Is64BitGame(games[gameIndex])
+                            ? warning
+                            : good)
+                );
+            }
+
+            SDL_Rect details{836, 218, 402, 390};
+            FillRect(renderer, details, panel);
+            StrokeRect(renderer, details, accentSoft, 2);
+
+            if (!games.empty()) {
+                const GameEntry& game = games[gameSelection];
+
+                DrawText(renderer, 864, 246, "SELECTED ITEM", 2, muted);
+                DrawText(
+                    renderer,
+                    864,
+                    280,
+                    Shorten(game.title, 25),
+                    3,
+                    white
+                );
+
+                DrawText(renderer, 864, 342, "ARCHITECTURE", 2, muted);
+                DrawText(
+                    renderer,
+                    864,
+                    376,
+                    ArchitectureLabel(game),
+                    3,
+                    Is64BitGame(game) ? warning : good
+                );
+
+                DrawText(renderer, 864, 438, "EXECUTABLE", 2, muted);
+                DrawText(
+                    renderer,
+                    864,
+                    472,
+                    Shorten(game.wineExecutable, 28),
+                    2,
+                    white
+                );
+
+                DrawText(renderer, 864, 528, "DETECTED KEYS", 2, muted);
+                DrawText(
+                    renderer,
+                    864,
+                    560,
+                    std::to_string(game.detectedKeys.size()),
+                    4,
+                    accent
+                );
+            } else {
+                DrawText(renderer, 872, 270, "YOUR LIBRARY", 3, white);
+                DrawText(renderer, 872, 326, "IS EMPTY", 4, muted);
+                DrawText(renderer, 872, 406, "PRESS Y TO", 3, accent);
+                DrawText(renderer, 872, 448, "ADD A FOLDER", 3, white);
+            }
+
+            if (!diagnostic.empty()) {
+                SDL_Rect message{42, 622, 1196, 42};
+                FillRect(renderer, message, panelSoft);
+                DrawText(
+                    renderer,
+                    58,
+                    636,
+                    Shorten(diagnostic, 92),
+                    2,
+                    Is64BitGame(
+                        games.empty()
+                            ? GameEntry{}
+                            : games[gameSelection]
+                    ) ? warning : muted
+                );
+            }
+
+            DrawButtonHint(renderer, 42, 676, "A", "PLAY", accent, white);
+            DrawButtonHint(renderer, 198, 676, "X", "CONTROLS", panelSoft, white);
+            DrawButtonHint(renderer, 430, 676, "Y", "ADD GAME", panelSoft, white);
+            DrawButtonHint(renderer, 640, 676, "B", "HOME", panelSoft, white);
+            DrawText(renderer, 918, 684, "VIEW  NEXT EXE", 2, muted);
         }
 
-        if (!diagnostic.empty()) {
-            DrawText(renderer, 50, 620, Shorten(diagnostic, 85), 2, muted);
-        }
-        DrawText(
-            renderer,
-            50,
-            675,
-            "SELECT   A PLAY   X CONTROLS   VIEW NEXT EXE   Y ADD FOLDER   B EXIT",
-            2,
-            white
-        );
         SDL_RenderPresent(renderer);
     }
 
     if (menuController) {
         SDL_GameControllerClose(menuController);
     }
+
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
     return accepted;

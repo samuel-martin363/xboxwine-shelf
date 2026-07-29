@@ -21,6 +21,7 @@ struct GameEntry {
     std::string nativeRoot;
     std::string manifestPath;
     std::string wineExecutable;
+    std::string architecture = "unknown";
     std::vector<std::string> executableCandidates;
     std::vector<std::string> detectedKeys;
     std::string arguments;

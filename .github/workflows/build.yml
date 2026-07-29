@@ -23,7 +23,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: work/boxedwine
-          key: boxedwine-uwp-windows2022-x64-official-sdl-v2
+          key: boxedwine-uwp-windows2022-x64-official-sdl-v3
 
       - name: Restore official SDL2 UWP cache
         id: sdl2-cache
@@ -87,11 +87,11 @@ jobs:
               "project\msvc\BoxedWine\uwp\Package.appxmanifest"
 
           $manifestText = Get-Content -Raw $manifestPath
-          if (-not $manifestText.Contains('Version="0.2.7.0"')) {
-              throw "Manifest version verification failed. Expected 0.2.7.0."
+          if (-not $manifestText.Contains('Version="0.2.8.0"')) {
+              throw "Manifest version verification failed. Expected 0.2.8.0."
           }
 
-          Write-Host "Verified package identity version 0.2.7.0."
+          Write-Host "Verified package identity version 0.2.8.0."
 
       - name: Build official SDL2 UWP renderer
         shell: pwsh
@@ -267,7 +267,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: work/boxedwine
-          key: boxedwine-uwp-windows2022-x64-official-sdl-v2
+          key: boxedwine-uwp-windows2022-x64-official-sdl-v3
 
       - name: Restore Wine runtime cache
         id: wine-runtime-cache
@@ -451,20 +451,20 @@ jobs:
           $bundle = Get-ChildItem `
               $packageFolder `
               -Recurse `
-              -Filter "*0.2.7.0*x64*.msixbundle" |
+              -Filter "*0.2.8.0*x64*.msixbundle" |
               Select-Object -First 1
 
           if (-not $bundle) {
-              throw "A v0.2.7.0 x64 MSIX bundle was not produced."
+              throw "A v0.2.8.0 x64 MSIX bundle was not produced."
           }
 
           @"
-          XboxWine Shelf v0.2.7.0
+          XboxWine Shelf v0.2.8.0
           Official SDL2 UWP / Direct3D 11 recovery build
           GitHub run: $env:GITHUB_RUN_NUMBER
           Commit: $env:GITHUB_SHA
           "@ | Set-Content `
-              (Join-Path $packageFolder "THIS-IS-XBOXWINE-v0.2.7.txt") `
+              (Join-Path $packageFolder "THIS-IS-XBOXWINE-v0.2.8.txt") `
               -Encoding UTF8
 
           Get-ChildItem $packageFolder -Recurse |
@@ -473,7 +473,7 @@ jobs:
       - name: Upload Xbox package
         uses: actions/upload-artifact@v7
         with:
-          name: XboxWine-Shelf-v0.2.7-x64
+          name: XboxWine-Shelf-v0.2.8-x64
           path: artifacts/AppPackages/
           if-no-files-found: error
           compression-level: 0
