@@ -123,7 +123,7 @@ jobs:
                   --timeout=30 `
                   --user-agent="Wget/1.21.4" `
                   --output-document=$temporary `
-                  "$baseUrl?use_mirror=$mirror"
+                  "${baseUrl}?use_mirror=${mirror}"
 
               if (
                   $LASTEXITCODE -eq 0 -and
