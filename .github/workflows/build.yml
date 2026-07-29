@@ -199,9 +199,9 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          $project = Join-Path `
+          $solution = Join-Path `
               $env:BOXEDWINE_ROOT `
-              "project\msvc\BoxedWine\uwp\uwp.vcxproj"
+              "project\msvc\BoxedWine\BoxedWine.sln"
 
           $packageFolder = Join-Path `
               $env:GITHUB_WORKSPACE `
@@ -209,8 +209,9 @@ jobs:
 
           New-Item -ItemType Directory -Force $packageFolder | Out-Null
 
-          msbuild.exe $project `
+          msbuild.exe $solution `
               /m `
+              /restore `
               /t:Build `
               /p:Configuration=Release `
               /p:Platform=x64 `
