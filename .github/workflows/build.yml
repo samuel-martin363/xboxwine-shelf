@@ -18,6 +18,13 @@ jobs:
       - name: Check out XboxWine Shelf
         uses: actions/checkout@v6
 
+      - name: Restore compiled BoxedWine cache
+        id: boxedwine-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: work/boxedwine
+          key: boxedwine-uwp-windows2022-x64-v1
+
       - name: Enable MSBuild
         uses: microsoft/setup-msbuild@v2
 
@@ -29,32 +36,39 @@ jobs:
           $archive = Join-Path $env:RUNNER_TEMP "boxedwine-uwp.zip"
           $extract = Join-Path $env:GITHUB_WORKSPACE "work\source"
           $repoRoot = Join-Path $env:GITHUB_WORKSPACE "work\boxedwine"
+          $solution = Join-Path $repoRoot "project\msvc\BoxedWine\BoxedWine.sln"
 
-          New-Item -ItemType Directory -Force $extract | Out-Null
+          if (-not (Test-Path $solution)) {
+              Write-Host "No compiled cache found. Downloading BoxedWine UWP."
 
-          curl.exe `
-            --fail `
-            --location `
-            --retry 5 `
-            --retry-all-errors `
-            "https://codeload.github.com/worleydl/Boxedwine-uwp/zip/refs/heads/uwp-compat" `
-            --output $archive
+              New-Item -ItemType Directory -Force $extract | Out-Null
 
-          Expand-Archive -Path $archive -DestinationPath $extract -Force
+              curl.exe `
+                --fail `
+                --location `
+                --retry 5 `
+                --retry-all-errors `
+                "https://codeload.github.com/worleydl/Boxedwine-uwp/zip/refs/heads/uwp-compat" `
+                --output $archive
 
-          $downloaded = Get-ChildItem $extract -Directory |
-              Where-Object { $_.Name -like "Boxedwine-uwp-*" } |
-              Select-Object -First 1
+              Expand-Archive -Path $archive -DestinationPath $extract -Force
 
-          if (-not $downloaded) {
-              throw "Downloaded BoxedWine folder was not found."
+              $downloaded = Get-ChildItem $extract -Directory |
+                  Where-Object { $_.Name -like "Boxedwine-uwp-*" } |
+                  Select-Object -First 1
+
+              if (-not $downloaded) {
+                  throw "Downloaded BoxedWine folder was not found."
+              }
+
+              if (Test-Path $repoRoot) {
+                  Remove-Item $repoRoot -Recurse -Force
+              }
+
+              Move-Item $downloaded.FullName $repoRoot
+          } else {
+              Write-Host "Reusing cached BoxedWine source and compiled outputs."
           }
-
-          if (Test-Path $repoRoot) {
-              Remove-Item $repoRoot -Recurse -Force
-          }
-
-          Move-Item $downloaded.FullName $repoRoot
 
           .\apply-patch.ps1 -RepoRoot $repoRoot
 
@@ -87,19 +101,46 @@ jobs:
               throw "Compilation failed with exit code $LASTEXITCODE."
           }
 
+      - name: Save compiled BoxedWine cache
+        if: steps.boxedwine-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: work/boxedwine
+          key: boxedwine-uwp-windows2022-x64-v1
+
+      - name: Restore Wine runtime cache
+        id: wine-runtime-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: runtime-cache/Debian10-Wine-5.0.zip
+          key: boxedwine-debian10-wine-5-runtime-v1
+
       - name: Download Wine runtime
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-
-          choco install wget -y --no-progress
 
           $uwpFolder = Join-Path `
               $env:BOXEDWINE_ROOT `
               "project\msvc\BoxedWine\uwp"
 
           $destination = Join-Path $uwpFolder "Debian10-Wine-5.0.zip"
+          $cacheFile = Join-Path `
+              $env:GITHUB_WORKSPACE `
+              "runtime-cache\Debian10-Wine-5.0.zip"
           $temporary = "$destination.part"
+
+          if (
+              (Test-Path $cacheFile) -and
+              (Get-Item $cacheFile).Length -gt 100MB
+          ) {
+              Write-Host "Reusing cached Wine runtime."
+              Copy-Item $cacheFile $destination -Force
+              Get-Item $destination | Select-Object FullName, Length
+              exit 0
+          }
+
+          choco install wget -y --no-progress
 
           $baseUrl = "https://sourceforge.net/projects/boxedwine/files/FileSystems/Full/v5/Debian10-Wine-5.0.zip/download"
 
@@ -134,6 +175,11 @@ jobs:
 
                   if ($LASTEXITCODE -eq 0) {
                       Move-Item $temporary $destination -Force
+                      New-Item `
+                          -ItemType Directory `
+                          -Force `
+                          (Split-Path $cacheFile) | Out-Null
+                      Copy-Item $destination $cacheFile -Force
                       $downloaded = $true
                       break
                   }
@@ -145,6 +191,13 @@ jobs:
           }
 
           Get-Item $destination | Select-Object FullName, Length
+
+      - name: Save Wine runtime cache
+        if: steps.wine-runtime-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: runtime-cache/Debian10-Wine-5.0.zip
+          key: boxedwine-debian10-wine-5-runtime-v1
 
       - name: Create temporary package signing certificate
         shell: pwsh

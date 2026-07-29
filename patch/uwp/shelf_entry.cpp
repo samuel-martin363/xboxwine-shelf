@@ -15,6 +15,7 @@
 
 #include <chrono>
 #include <exception>
+#include <fstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -25,20 +26,28 @@ namespace {
 
 void WriteStartupLog(const std::string& line, bool reset = false) noexcept {
     try {
-        using namespace winrt;
-        using namespace Windows::Storage;
+        using namespace winrt::Windows::Storage;
 
+        // Avoid blocking C++/WinRT async .get() calls during UWP startup.
+        // The app is allowed to write synchronously inside its own LocalFolder.
         const StorageFolder local = ApplicationData::Current().LocalFolder();
-        const StorageFile file = local.CreateFileAsync(
-            L"xboxwine-startup.log",
-            CreationCollisionOption::OpenIfExists
-        ).get();
 
-        const std::string text = line + "\r\n";
-        if (reset) {
-            FileIO::WriteTextAsync(file, to_hstring(text)).get();
-        } else {
-            FileIO::AppendTextAsync(file, to_hstring(text)).get();
+        std::string path = winrt::to_string(local.Path());
+        if (!path.empty() && path.back() != '\\') {
+            path.push_back('\\');
+        }
+        path += "xboxwine-startup.log";
+
+        const std::ios::openmode mode =
+            std::ios::binary |
+            std::ios::out |
+            (reset ? std::ios::trunc : std::ios::app);
+
+        std::ofstream file(path, mode);
+        if (file) {
+            file.write(line.data(), static_cast<std::streamsize>(line.size()));
+            file.write("\r\n", 2);
+            file.flush();
         }
     } catch (...) {
         // Logging must never become another startup failure.
