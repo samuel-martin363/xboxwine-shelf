@@ -1,4 +1,4 @@
-﻿name: Build XboxWine Shelf
+name: Build XboxWine Shelf
 
 on:
   workflow_dispatch:
@@ -78,6 +78,9 @@ jobs:
               /t:Build `
               /p:Configuration=Release `
               /p:Platform=x64 `
+              /p:GenerateAppxPackageOnBuild=false `
+              /p:AppxPackageSigningEnabled=false `
+              /p:AppxBundle=Never `
               /bl:".\logs\compile.binlog"
 
           if ($LASTEXITCODE -ne 0) {
@@ -143,6 +146,54 @@ jobs:
 
           Get-Item $destination | Select-Object FullName, Length
 
+      - name: Create temporary package signing certificate
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $uwpFolder = Join-Path `
+              $env:BOXEDWINE_ROOT `
+              "project\msvc\BoxedWine\uwp"
+
+          $pfxPath = Join-Path $uwpFolder "uwp_TemporaryKey.pfx"
+          $cerPath = Join-Path $env:RUNNER_TEMP "XboxWine-Shelf-TestCertificate.cer"
+          $passwordText = [Guid]::NewGuid().ToString("N")
+          $password = ConvertTo-SecureString `
+              $passwordText `
+              -AsPlainText `
+              -Force
+
+          $certificate = New-SelfSignedCertificate `
+              -Type Custom `
+              -Subject "CN=danwo" `
+              -FriendlyName "XboxWine Shelf test signing certificate" `
+              -CertStoreLocation "Cert:\CurrentUser\My" `
+              -KeyAlgorithm RSA `
+              -KeyLength 2048 `
+              -HashAlgorithm SHA256 `
+              -KeyExportPolicy Exportable `
+              -KeyUsage DigitalSignature `
+              -TextExtension @(
+                  "2.5.29.37={text}1.3.6.1.5.5.7.3.3",
+                  "2.5.29.19={text}"
+              )
+
+          Export-PfxCertificate `
+              -Cert $certificate `
+              -FilePath $pfxPath `
+              -Password $password | Out-Null
+
+          Export-Certificate `
+              -Cert $certificate `
+              -FilePath $cerPath | Out-Null
+
+          "PACKAGE_CERT_PASSWORD=$passwordText" |
+              Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "PACKAGE_CERT_PUBLIC=$cerPath" |
+              Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          Write-Host "Created temporary package certificate for CN=danwo."
+
       - name: Create Xbox package
         shell: pwsh
         run: |
@@ -160,19 +211,27 @@ jobs:
 
           msbuild.exe $project `
               /m `
-              /t:Rebuild `
+              /t:Build `
               /p:Configuration=Release `
               /p:Platform=x64 `
               /p:GenerateAppxPackageOnBuild=true `
               /p:UapAppxPackageBuildMode=SideloadOnly `
               /p:AppxBundle=Always `
               /p:AppxBundlePlatforms=x64 `
+              /p:AppxPackageSigningEnabled=true `
+              "/p:PackageCertificateKeyFile=$env:BOXEDWINE_ROOT\project\msvc\BoxedWine\uwp\uwp_TemporaryKey.pfx" `
+              "/p:PackageCertificatePassword=$env:PACKAGE_CERT_PASSWORD" `
               "/p:AppxPackageDir=$packageFolder\" `
               /bl:".\logs\package.binlog"
 
           if ($LASTEXITCODE -ne 0) {
               throw "Package creation failed with exit code $LASTEXITCODE."
           }
+
+          Copy-Item `
+              $env:PACKAGE_CERT_PUBLIC `
+              (Join-Path $packageFolder "XboxWine-Shelf-TestCertificate.cer") `
+              -Force
 
           Get-ChildItem $packageFolder -Recurse |
               Select-Object FullName, Length
