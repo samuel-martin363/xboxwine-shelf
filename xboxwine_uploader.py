@@ -9,21 +9,27 @@ local network. No third-party Python packages are required.
 from __future__ import annotations
 
 import argparse
+import atexit
+import gc
 import os
 from pathlib import Path
 import queue
 import re
+import shutil
 import socket
 import struct
 import tempfile
 import threading
+import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+from urllib.request import Request, urlopen
 import zipfile
 
 PORT = 24872
 MAGIC = b"XWUP2\0\0\0"
 MAX_SCAN_BYTES = 96 * 1024 * 1024
+VC_REDIST_X86_URL = "https://aka.ms/vc14/vc_redist.x86.exe"
 
 BAD_EXE_WORDS = {
     "unins", "uninstall", "setup", "install", "installer", "updater",
@@ -66,6 +72,59 @@ DEFAULT_BINDINGS = {
     "RS_UP": "NONE", "RS_DOWN": "NONE", "RS_LEFT": "NONE", "RS_RIGHT": "NONE",
 }
 
+
+
+def safe_remove_tree(path: Path, attempts: int = 12) -> None:
+    """Remove temporary files without turning antivirus locks into app errors."""
+    for attempt in range(attempts):
+        try:
+            shutil.rmtree(path)
+            return
+        except FileNotFoundError:
+            return
+        except PermissionError:
+            gc.collect()
+            time.sleep(0.15 * (attempt + 1))
+        except OSError:
+            gc.collect()
+            time.sleep(0.15 * (attempt + 1))
+    # Leave the folder for Windows temp cleanup rather than crashing at exit.
+
+
+def make_work_folder() -> Path:
+    folder = Path(tempfile.mkdtemp(prefix="xboxwine-"))
+    atexit.register(safe_remove_tree, folder)
+    return folder
+
+
+def download_file(url: str, output: Path, progress=None) -> None:
+    request = Request(url, headers={"User-Agent": "XboxWine-Uploader/0.2.9"})
+    with urlopen(request, timeout=60) as response, output.open("wb") as stream:
+        total = int(response.headers.get("Content-Length") or 0)
+        completed = 0
+        while True:
+            chunk = response.read(1024 * 1024)
+            if not chunk:
+                break
+            stream.write(chunk)
+            completed += len(chunk)
+            if progress:
+                progress("Downloading VC++ x86 runtime", completed, max(total, 1))
+
+
+def find_runtime_installers(root: Path) -> dict[str, tuple[Path, str]]:
+    """Find runtime installers already shipped with a game folder."""
+    found: dict[str, tuple[Path, str]] = {}
+    for path in root.rglob("*.exe"):
+        name = path.name.lower()
+        lowered = str(path).lower()
+        if name == "dxsetup.exe" and "directx" in lowered:
+            found.setdefault("directx", (path, "/silent"))
+        elif name in {"oalinst.exe", "openal.exe"}:
+            found.setdefault("openal", (path, "/S"))
+        elif "dotnetfx" in name or name.startswith("ndp"):
+            found.setdefault("dotnet", (path, "/q /norestart"))
+    return found
 
 def pe_architecture(path: Path) -> str:
     """Return x86, x64, arm, arm64, or unknown from a PE header."""
@@ -304,9 +363,12 @@ def make_manifest(
     candidates: list[tuple[Path, str, int]],
     detected: list[str],
     root: Path,
+    include_vc_runtime: bool = False,
 ) -> str:
     bindings = choose_default_bindings(detected)
     candidate_paths = [normalize_wine_path(path.relative_to(root)) for path, _, _ in candidates]
+    candidate_architectures = [architecture for _, architecture, _ in candidates]
+    runtime_installers = find_runtime_installers(root)
     selected_architecture = next(
         (architecture for path, architecture, _ in candidates if path == executable),
         pe_architecture(executable),
@@ -318,6 +380,7 @@ def make_manifest(
         f"exe={normalize_wine_path(executable.relative_to(root))}",
         f"architecture={selected_architecture}",
         "candidate_exes=" + "|".join(candidate_paths),
+        "candidate_architectures=" + "|".join(candidate_architectures),
         "detected_keys=" + ",".join(detected),
         "arguments=",
         "fullscreen=aspect",
@@ -328,21 +391,48 @@ def make_manifest(
         "stick_deadzone=9000",
         "extra_boxedwine_args=",
     ]
+    if include_vc_runtime:
+        lines.append(
+            "runtime_vc14_x86="
+            "c:\\xboxwine\\__xboxwine_runtimes\\vc_redist.x86.exe"
+        )
+    for runtime_name, (runtime_path, _arguments) in runtime_installers.items():
+        lines.append(
+            f"runtime_{runtime_name}="
+            f"{normalize_wine_path(runtime_path.relative_to(root))}"
+        )
     lines.extend(f"bind_{name.lower()}={value}" for name, value in bindings.items())
     return "\n".join(lines) + "\n"
 
 
-def zip_folder(root: Path, output: Path, progress=None) -> None:
+def zip_folder(
+    root: Path,
+    output: Path,
+    progress=None,
+    extra_files: dict[Path, str] | None = None,
+) -> None:
     files = [path for path in root.rglob("*") if path.is_file()]
+    extras = extra_files or {}
     total = sum(path.stat().st_size for path in files)
+    total += sum(path.stat().st_size for path in extras)
     completed = 0
-    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED,
-                         compresslevel=6, allowZip64=True) as archive:
+    with zipfile.ZipFile(
+        output,
+        "w",
+        compression=zipfile.ZIP_DEFLATED,
+        compresslevel=6,
+        allowZip64=True,
+    ) as archive:
         for path in files:
             archive.write(path, path.relative_to(root))
             completed += path.stat().st_size
             if progress:
                 progress("Packing folder", completed, max(total, 1))
+        for source, archive_name in extras.items():
+            archive.write(source, archive_name)
+            completed += source.stat().st_size
+            if progress:
+                progress("Packing runtime files", completed, max(total, 1))
 
 
 def send_game(
@@ -385,6 +475,9 @@ class UploaderApp:
         self.candidates: list[tuple[Path, str, int]] = []
         self.detected: list[str] = []
         self.events: queue.Queue[tuple[str, object]] = queue.Queue()
+        self.send_thread: threading.Thread | None = None
+        self.sending = False
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
         frame = ttk.Frame(root, padding=18)
         frame.pack(fill="both", expand=True)
@@ -466,25 +559,82 @@ class UploaderApp:
         executable = self.candidates[index][0]
         title = self.title_var.get().strip() or self.folder.name
         self.send_button.state(["disabled"])
-        threading.Thread(
+        self.sending = True
+        self.send_thread = threading.Thread(
             target=self.send_worker,
-            args=(xbox_ip, title, executable),
-            daemon=True,
-        ).start()
+            args=(
+                xbox_ip,
+                title,
+                executable,
+                bool(self.include_vc_var.get()),
+            ),
+            daemon=False,
+        )
+        self.send_thread.start()
 
-    def send_worker(self, xbox_ip: str, title: str, executable: Path) -> None:
+    def send_worker(
+        self,
+        xbox_ip: str,
+        title: str,
+        executable: Path,
+        include_vc_runtime: bool,
+    ) -> None:
         assert self.folder is not None
+        work_folder = make_work_folder()
         try:
+            extras: dict[Path, str] = {}
+            selected_architecture = pe_architecture(executable)
+            include_vc_runtime = include_vc_runtime and selected_architecture == "x86"
+
+            if include_vc_runtime:
+                vc_runtime = work_folder / "vc_redist.x86.exe"
+                download_file(
+                    VC_REDIST_X86_URL,
+                    vc_runtime,
+                    self.post_progress,
+                )
+                extras[vc_runtime] = (
+                    "__xboxwine_runtimes/vc_redist.x86.exe"
+                )
+
             manifest = make_manifest(
-                title, executable, self.candidates, self.detected, self.folder
+                title,
+                executable,
+                self.candidates,
+                self.detected,
+                self.folder,
+                include_vc_runtime=include_vc_runtime,
             )
-            with tempfile.TemporaryDirectory(prefix="xboxwine-") as temporary:
-                archive = Path(temporary) / "game.zip"
-                zip_folder(self.folder, archive, self.post_progress)
-                send_game(xbox_ip, PORT, manifest, archive, self.post_progress)
+            archive = work_folder / "game.zip"
+            zip_folder(
+                self.folder,
+                archive,
+                self.post_progress,
+                extra_files=extras,
+            )
+            send_game(
+                xbox_ip,
+                PORT,
+                manifest,
+                archive,
+                self.post_progress,
+            )
             self.events.put(("done", title))
         except Exception as error:  # GUI boundary
             self.events.put(("error", str(error)))
+        finally:
+            safe_remove_tree(work_folder)
+            self.events.put(("send_finished", None))
+
+    def on_close(self) -> None:
+        if self.sending:
+            messagebox.showwarning(
+                "XboxWine",
+                "Packing or transfer is still running. Wait for it to finish "
+                "before closing the uploader.",
+            )
+            return
+        self.root.destroy()
 
     def post_progress(self, stage: str, done: int, total: int) -> None:
         self.events.put(("progress", (stage, done, total)))
@@ -521,6 +671,9 @@ class UploaderApp:
                     percent = max(0.0, min(100.0, done * 100.0 / total))
                     self.progress["value"] = percent
                     self.status_var.set(f"{stage}: {percent:.1f}%")
+                elif kind == "send_finished":
+                    self.sending = False
+                    self.send_thread = None
                 elif kind == "done":
                     self.progress["value"] = 100
                     self.status_var.set(
@@ -562,11 +715,14 @@ def cli_main(args: argparse.Namespace) -> int:
     def progress(stage: str, done: int, total: int) -> None:
         print(f"\r{stage}: {done * 100.0 / total:5.1f}%", end="", flush=True)
 
-    with tempfile.TemporaryDirectory(prefix="xboxwine-") as temporary:
-        archive = Path(temporary) / "game.zip"
+    work_folder = make_work_folder()
+    try:
+        archive = work_folder / "game.zip"
         zip_folder(folder, archive, progress)
         print()
         send_game(args.xbox, args.port, manifest, archive, progress)
+    finally:
+        safe_remove_tree(work_folder)
         print()
     print("Transfer complete.")
     return 0

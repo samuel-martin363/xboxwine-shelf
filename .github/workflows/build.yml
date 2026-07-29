@@ -23,7 +23,9 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: work/boxedwine
-          key: boxedwine-uwp-windows2022-x64-official-sdl-v3
+          key: boxedwine-uwp-fast-v4-${{ hashFiles('apply-patch.ps1', 'patch/uwp/**') }}
+          restore-keys: |
+            boxedwine-uwp-fast-v4-
 
       - name: Restore official SDL2 UWP cache
         id: sdl2-cache
@@ -87,11 +89,11 @@ jobs:
               "project\msvc\BoxedWine\uwp\Package.appxmanifest"
 
           $manifestText = Get-Content -Raw $manifestPath
-          if (-not $manifestText.Contains('Version="0.2.8.0"')) {
-              throw "Manifest version verification failed. Expected 0.2.8.0."
+          if (-not $manifestText.Contains('Version="0.2.9.0"')) {
+              throw "Manifest version verification failed. Expected 0.2.9.0."
           }
 
-          Write-Host "Verified package identity version 0.2.8.0."
+          Write-Host "Verified package identity version 0.2.9.0."
 
       - name: Build official SDL2 UWP renderer
         shell: pwsh
@@ -236,30 +238,53 @@ jobs:
           path: work/sdl2-uwp
           key: sdl2-uwp-release-2.28.5-v143-x64-v1
 
-      - name: Compile XboxWine
+      - name: Fast compile check
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
           New-Item -ItemType Directory -Force ".\logs" | Out-Null
 
-          $solution = Join-Path `
+          $solutionDir = Join-Path `
               $env:BOXEDWINE_ROOT `
-              "project\msvc\BoxedWine\BoxedWine.sln"
+              "project\msvc\BoxedWine"
+          $solution = Join-Path $solutionDir "BoxedWine.sln"
+          $project = Join-Path $solutionDir "uwp\uwp.vcxproj"
+          $boxedLibrary = Join-Path `
+              $solutionDir `
+              "x64\Release\BoxedWine\BoxedWine.lib"
 
-          msbuild.exe $solution `
-              /m `
-              /restore `
-              /t:Build `
-              /p:Configuration=Release `
-              /p:Platform=x64 `
-              /p:GenerateAppxPackageOnBuild=false `
-              /p:AppxPackageSigningEnabled=false `
-              /p:AppxBundle=Never `
-              /bl:".\logs\compile.binlog"
+          if (Test-Path $boxedLibrary) {
+              Write-Host "Compiling only changed XboxWine UWP sources."
+
+              msbuild.exe $project `
+                  /m `
+                  /t:Build `
+                  /p:Configuration=Release `
+                  /p:Platform=x64 `
+                  /p:BuildProjectReferences=false `
+                  "/p:SolutionDir=$solutionDir\" `
+                  /p:GenerateAppxPackageOnBuild=false `
+                  /p:AppxPackageSigningEnabled=false `
+                  /p:AppxBundle=Never `
+                  /bl:".\logs\quick-compile.binlog"
+          } else {
+              Write-Host "No exact cache yet. Running one full dependency build."
+
+              msbuild.exe $solution `
+                  /m `
+                  /restore `
+                  /t:Build `
+                  /p:Configuration=Release `
+                  /p:Platform=x64 `
+                  /p:GenerateAppxPackageOnBuild=false `
+                  /p:AppxPackageSigningEnabled=false `
+                  /p:AppxBundle=Never `
+                  /bl:".\logs\full-compile.binlog"
+          }
 
           if ($LASTEXITCODE -ne 0) {
-              throw "Compilation failed with exit code $LASTEXITCODE."
+              throw "Fast compile check failed with exit code $LASTEXITCODE."
           }
 
       - name: Save compiled BoxedWine cache
@@ -267,7 +292,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: work/boxedwine
-          key: boxedwine-uwp-windows2022-x64-official-sdl-v3
+          key: boxedwine-uwp-fast-v4-${{ hashFiles('apply-patch.ps1', 'patch/uwp/**') }}
 
       - name: Restore Wine runtime cache
         id: wine-runtime-cache
@@ -413,9 +438,10 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          $solution = Join-Path `
+          $solutionDir = Join-Path `
               $env:BOXEDWINE_ROOT `
-              "project\msvc\BoxedWine\BoxedWine.sln"
+              "project\msvc\BoxedWine"
+          $project = Join-Path $solutionDir "uwp\uwp.vcxproj"
 
           $packageFolder = Join-Path `
               $env:GITHUB_WORKSPACE `
@@ -423,12 +449,13 @@ jobs:
 
           New-Item -ItemType Directory -Force $packageFolder | Out-Null
 
-          msbuild.exe $solution `
+          msbuild.exe $project `
               /m `
-              /restore `
               /t:Build `
               /p:Configuration=Release `
               /p:Platform=x64 `
+              /p:BuildProjectReferences=false `
+              "/p:SolutionDir=$solutionDir\" `
               /p:GenerateAppxPackageOnBuild=true `
               /p:UapAppxPackageBuildMode=SideloadOnly `
               /p:AppxBundle=Always `
@@ -451,20 +478,20 @@ jobs:
           $bundle = Get-ChildItem `
               $packageFolder `
               -Recurse `
-              -Filter "*0.2.8.0*x64*.msixbundle" |
+              -Filter "*0.2.9.0*x64*.msixbundle" |
               Select-Object -First 1
 
           if (-not $bundle) {
-              throw "A v0.2.8.0 x64 MSIX bundle was not produced."
+              throw "A v0.2.9.0 x64 MSIX bundle was not produced."
           }
 
           @"
-          XboxWine Shelf v0.2.8.0
-          Official SDL2 UWP / Direct3D 11 recovery build
+          XboxWine Shelf v0.2.9.0
+          Fast cached build / Direct3D 11 / runtime manager
           GitHub run: $env:GITHUB_RUN_NUMBER
           Commit: $env:GITHUB_SHA
           "@ | Set-Content `
-              (Join-Path $packageFolder "THIS-IS-XBOXWINE-v0.2.8.txt") `
+              (Join-Path $packageFolder "THIS-IS-XBOXWINE-v0.2.9.txt") `
               -Encoding UTF8
 
           Get-ChildItem $packageFolder -Recurse |
@@ -473,7 +500,7 @@ jobs:
       - name: Upload Xbox package
         uses: actions/upload-artifact@v7
         with:
-          name: XboxWine-Shelf-v0.2.8-x64
+          name: XboxWine-Shelf-v0.2.9-x64
           path: artifacts/AppPackages/
           if-no-files-found: error
           compression-level: 0

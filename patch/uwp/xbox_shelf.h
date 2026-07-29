@@ -1,6 +1,7 @@
 #pragma once
 
 #include <map>
+#include <utility>
 #include <string>
 #include <vector>
 
@@ -23,6 +24,8 @@ struct GameEntry {
     std::string wineExecutable;
     std::string architecture = "unknown";
     std::vector<std::string> executableCandidates;
+    std::vector<std::string> executableArchitectures;
+    std::vector<std::pair<std::string, std::string>> runtimeInstallers;
     std::vector<std::string> detectedKeys;
     std::string arguments;
     std::string fullscreen = "aspect";

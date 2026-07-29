@@ -192,12 +192,12 @@ $manifest = $manifest.Replace(
 $manifest = [System.Text.RegularExpressions.Regex]::Replace(
     $manifest,
     '(<Identity\b[^>]*\bVersion=")[^"]+(")',
-    '${1}0.2.8.0${2}',
+    '${1}0.2.9.0${2}',
     1
 )
 
-if (-not $manifest.Contains('Version="0.2.8.0"')) {
-    throw "Failed to set Package.appxmanifest version to 0.2.8.0."
+if (-not $manifest.Contains('Version="0.2.9.0"')) {
+    throw "Failed to set Package.appxmanifest version to 0.2.9.0."
 }
 
 if (-not $manifest.Contains('Name="privateNetworkClientServer"')) {
@@ -213,5 +213,5 @@ if (-not $manifest.Contains('Name="privateNetworkClientServer"')) {
 
 Set-Content -Path $manifestPath -Value $manifest -Encoding UTF8
 
-Write-Host "Patched XboxWine Shelf v0.2.8 source and Visual Studio project." -ForegroundColor Green
+Write-Host "Patched XboxWine Shelf v0.2.9 source and Visual Studio project." -ForegroundColor Green
 Write-Host "Original files saved in: $backupDir"

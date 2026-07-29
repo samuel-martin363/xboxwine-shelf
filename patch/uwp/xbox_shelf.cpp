@@ -14,9 +14,11 @@
 #include <winrt/base.h>
 #include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Storage.h>
+#include <winrt/Windows.UI.Core.h>
 #include <winrt/Windows.ApplicationModel.h>
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <cctype>
 #include <map>
@@ -32,6 +34,7 @@ namespace {
 using namespace winrt;
 using namespace Windows::Storage;
 using namespace Windows::ApplicationModel;
+using namespace Windows::UI::Core;
 
 const std::vector<std::pair<std::string, std::string>> kControllerInputs{
     {"A", "A BUTTON"}, {"B", "B BUTTON"},
@@ -47,6 +50,47 @@ const std::vector<std::pair<std::string, std::string>> kControllerInputs{
     {"RS_UP", "RIGHT STICK UP"}, {"RS_DOWN", "RIGHT STICK DOWN"},
     {"RS_LEFT", "RIGHT STICK LEFT"}, {"RS_RIGHT", "RIGHT STICK RIGHT"}
 };
+
+std::atomic<bool> gSystemBackRequested{false};
+SystemNavigationManager gSystemNavigationManager{nullptr};
+winrt::event_token gSystemBackToken{};
+bool gSystemBackHandlerInstalled = false;
+
+void InstallSystemBackHandler() {
+    if (gSystemBackHandlerInstalled) {
+        return;
+    }
+    try {
+        gSystemNavigationManager =
+            SystemNavigationManager::GetForCurrentView();
+        gSystemBackToken = gSystemNavigationManager.BackRequested(
+            [](
+                const IInspectable&,
+                const BackRequestedEventArgs& arguments
+            ) {
+                arguments.Handled(true);
+                gSystemBackRequested.store(true);
+            }
+        );
+        gSystemBackHandlerInstalled = true;
+    } catch (...) {
+        // SDL keyboard/controller events still provide a fallback.
+    }
+}
+
+bool ConsumeSystemBackRequest() {
+    return gSystemBackRequested.exchange(false);
+}
+
+void ClearBackInput() {
+    gSystemBackRequested.store(false);
+    SDL_FlushEvent(SDL_KEYDOWN);
+    SDL_FlushEvent(SDL_KEYUP);
+    SDL_FlushEvent(SDL_CONTROLLERBUTTONDOWN);
+    SDL_FlushEvent(SDL_CONTROLLERBUTTONUP);
+    SDL_Delay(120);
+    gSystemBackRequested.store(false);
+}
 
 std::string Trim(const std::string& input) {
     const auto first = std::find_if_not(
@@ -136,6 +180,19 @@ std::vector<std::string> SplitList(
         if (seen.insert(normalized).second) {
             result.push_back(item);
         }
+    }
+    return result;
+}
+
+std::vector<std::string> SplitOrderedList(
+    const std::string& text,
+    char delimiter
+) {
+    std::vector<std::string> result;
+    std::istringstream stream(text);
+    std::string item;
+    while (std::getline(stream, item, delimiter)) {
+        result.push_back(Trim(item));
     }
     return result;
 }
@@ -239,6 +296,31 @@ bool TryLoadGame(
         entry.executableCandidates = SplitList(
             read("candidate_exes", ""), '|'
         );
+        entry.executableArchitectures = SplitOrderedList(
+            read("candidate_architectures", ""), '|'
+        );
+        if (entry.executableArchitectures.size() !=
+            entry.executableCandidates.size()) {
+            entry.executableArchitectures.assign(
+                entry.executableCandidates.size(),
+                "unknown"
+            );
+        }
+
+        const auto addRuntime = [&](
+            const char* key,
+            const char* title
+        ) {
+            const std::string executable = read(key, "");
+            if (!executable.empty()) {
+                entry.runtimeInstallers.emplace_back(title, executable);
+            }
+        };
+        addRuntime("runtime_vc14_x86", "VC++ 2015-2022 X86");
+        addRuntime("runtime_directx", "DIRECTX LEGACY");
+        addRuntime("runtime_dotnet", ".NET FRAMEWORK");
+        addRuntime("runtime_openal", "OPENAL");
+
         entry.detectedKeys = SplitList(read("detected_keys", ""), ',');
         entry.arguments = read("arguments", "");
         entry.fullscreen = Lower(read("fullscreen", "aspect"));
@@ -365,6 +447,20 @@ bool SaveGame(GameEntry& game, std::string& diagnostic) {
         manifest << "architecture=" << game.architecture << "\n";
         manifest << "candidate_exes="
                  << JoinList(game.executableCandidates, '|') << "\n";
+        manifest << "candidate_architectures="
+                 << JoinList(game.executableArchitectures, '|') << "\n";
+        for (const auto& runtime : game.runtimeInstallers) {
+            const std::string label = Upper(runtime.first);
+            if (label.find("VC++") != std::string::npos) {
+                manifest << "runtime_vc14_x86=" << runtime.second << "\n";
+            } else if (label.find("DIRECTX") != std::string::npos) {
+                manifest << "runtime_directx=" << runtime.second << "\n";
+            } else if (label.find(".NET") != std::string::npos) {
+                manifest << "runtime_dotnet=" << runtime.second << "\n";
+            } else if (label.find("OPENAL") != std::string::npos) {
+                manifest << "runtime_openal=" << runtime.second << "\n";
+            }
+        }
         manifest << "detected_keys=" << JoinList(game.detectedKeys, ',') << "\n";
         manifest << "arguments=" << game.arguments << "\n";
         manifest << "fullscreen=" << game.fullscreen << "\n";
@@ -622,8 +718,12 @@ bool EditControls(
     Uint32 lastMove = 0;
 
     while (running) {
+        if (ConsumeSystemBackRequest()) {
+            game.controller = original;
+            running = false;
+        }
         SDL_Event event{};
-        while (SDL_PollEvent(&event)) {
+        while (running && SDL_PollEvent(&event)) {
             const Uint32 now = SDL_GetTicks();
             const bool canMove = now - lastMove > 120;
             if ((event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_UP) ||
@@ -767,6 +867,7 @@ bool EditControls(
         );
         SDL_RenderPresent(renderer);
     }
+    ClearBackInput();
     return saved;
 }
 
@@ -786,6 +887,11 @@ bool CycleExecutable(GameEntry& game, std::string& diagnostic) {
             game.executableCandidates.begin(), current
         )) + 1) % game.executableCandidates.size();
     game.wineExecutable = game.executableCandidates[index];
+    if (index < game.executableArchitectures.size()) {
+        game.architecture = Lower(game.executableArchitectures[index]);
+    } else {
+        game.architecture = "unknown";
+    }
     if (!SaveGame(game, diagnostic)) {
         return false;
     }
@@ -796,8 +902,11 @@ bool CycleExecutable(GameEntry& game, std::string& diagnostic) {
 void ShowTransferScreen(SDL_Renderer* renderer) {
     bool running = true;
     while (running) {
+        if (ConsumeSystemBackRequest()) {
+            running = false;
+        }
         SDL_Event event{};
-        while (SDL_PollEvent(&event)) {
+        while (running && SDL_PollEvent(&event)) {
             if ((event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_ESCAPE) ||
                 ControllerPressed(event, SDL_CONTROLLER_BUTTON_B)) {
                 running = false;
@@ -906,6 +1015,37 @@ bool Is64BitGame(const GameEntry& game) {
     return value == "x64" || value == "amd64";
 }
 
+bool Is32BitGame(const GameEntry& game) {
+    return Lower(game.architecture) == "x86";
+}
+
+std::string ArchitectureShortLabel(const GameEntry& game) {
+    if (Is32BitGame(game)) {
+        return "X86";
+    }
+    if (Is64BitGame(game)) {
+        return "X64";
+    }
+    return "UNK";
+}
+
+std::string RuntimeArguments(const std::string& title) {
+    const std::string label = Upper(title);
+    if (label.find("VC++") != std::string::npos) {
+        return "/install /quiet /norestart";
+    }
+    if (label.find("DIRECTX") != std::string::npos) {
+        return "/silent";
+    }
+    if (label.find(".NET") != std::string::npos) {
+        return "/q /norestart";
+    }
+    if (label.find("OPENAL") != std::string::npos) {
+        return "/S";
+    }
+    return {};
+}
+
 void FillRect(
     SDL_Renderer* renderer,
     const SDL_Rect& rect,
@@ -965,6 +1105,131 @@ std::map<std::string, std::string> DefaultControllerBindings() {
     };
 }
 
+bool ShowRuntimeMenu(
+    SDL_Renderer* renderer,
+    const GameEntry& game,
+    GameEntry& selected,
+    std::string& diagnostic
+) {
+    if (game.runtimeInstallers.empty()) {
+        diagnostic =
+            "NO RUNTIME INSTALLERS FOUND - REUPLOAD WITH VC++ X86 ENABLED";
+        ClearBackInput();
+        return false;
+    }
+
+    int selection = 0;
+    bool running = true;
+    bool accepted = false;
+    Uint32 lastMove = 0;
+
+    while (running) {
+        if (ConsumeSystemBackRequest()) {
+            running = false;
+        }
+
+        SDL_Event event{};
+        while (running && SDL_PollEvent(&event)) {
+            const Uint32 now = SDL_GetTicks();
+            const bool canMove = now - lastMove > 140;
+
+            if ((event.type == SDL_KEYDOWN &&
+                 event.key.keysym.sym == SDLK_UP) ||
+                ControllerPressed(event, SDL_CONTROLLER_BUTTON_DPAD_UP)) {
+                if (canMove) {
+                    selection = (selection - 1 +
+                        static_cast<int>(game.runtimeInstallers.size())) %
+                        static_cast<int>(game.runtimeInstallers.size());
+                    lastMove = now;
+                }
+            }
+
+            if ((event.type == SDL_KEYDOWN &&
+                 event.key.keysym.sym == SDLK_DOWN) ||
+                ControllerPressed(event, SDL_CONTROLLER_BUTTON_DPAD_DOWN)) {
+                if (canMove) {
+                    selection = (selection + 1) %
+                        static_cast<int>(game.runtimeInstallers.size());
+                    lastMove = now;
+                }
+            }
+
+            if ((event.type == SDL_KEYDOWN &&
+                 event.key.keysym.sym == SDLK_RETURN) ||
+                ControllerPressed(event, SDL_CONTROLLER_BUTTON_A)) {
+                selected = game;
+                selected.title = game.title + " - RUNTIME SETUP";
+                selected.wineExecutable =
+                    game.runtimeInstallers[selection].second;
+                selected.architecture = "x86";
+                selected.arguments = RuntimeArguments(
+                    game.runtimeInstallers[selection].first
+                );
+                accepted = true;
+                running = false;
+            }
+
+            if ((event.type == SDL_KEYDOWN &&
+                 event.key.keysym.sym == SDLK_ESCAPE) ||
+                ControllerPressed(event, SDL_CONTROLLER_BUTTON_B)) {
+                running = false;
+            }
+        }
+
+        SDL_SetRenderDrawColor(renderer, 7, 11, 18, 255);
+        SDL_RenderClear(renderer);
+        const SDL_Color white{239, 244, 251, 255};
+        const SDL_Color muted{144, 159, 180, 255};
+        const SDL_Color accent{54, 166, 255, 255};
+        const SDL_Color panel{23, 34, 50, 255};
+
+        DrawText(renderer, 48, 38, "RUNTIME SETUP", 5, white);
+        DrawText(renderer, 50, 98, Shorten(game.title, 58), 2, muted);
+        DrawText(
+            renderer,
+            50,
+            128,
+            "INSTALLERS MODIFY ONLY THIS GAME'S PRIVATE WINE ROOT",
+            2,
+            muted
+        );
+
+        for (int index = 0;
+             index < static_cast<int>(game.runtimeInstallers.size());
+             ++index) {
+            SDL_Rect item{48, 190 + index * 74, 1135, 58};
+            FillRect(
+                renderer,
+                item,
+                index == selection ? accent : panel
+            );
+            DrawText(
+                renderer,
+                item.x + 20,
+                item.y + 18,
+                game.runtimeInstallers[index].first,
+                3,
+                index == selection
+                    ? SDL_Color{5, 15, 26, 255}
+                    : white
+            );
+        }
+
+        DrawText(
+            renderer,
+            50,
+            665,
+            "A INSTALL   B RETURN - REOPEN XBOXWINE AFTER INSTALLER FINISHES",
+            2,
+            white
+        );
+        SDL_RenderPresent(renderer);
+    }
+
+    ClearBackInput();
+    return accepted;
+}
+
 bool PickGame(GameEntry& selected, std::string& diagnostic) {
     SDL_SetHint(SDL_HINT_RENDER_DRIVER, "direct3d11");
 
@@ -990,6 +1255,8 @@ bool PickGame(GameEntry& selected, std::string& diagnostic) {
         diagnostic = SDL_GetError();
         return false;
     }
+
+    InstallSystemBackHandler();
 
     SDL_Renderer* renderer = SDL_CreateRenderer(
         window,
@@ -1037,9 +1304,19 @@ bool PickGame(GameEntry& selected, std::string& diagnostic) {
     };
 
     while (running) {
+        const bool systemBack = ConsumeSystemBackRequest();
+        if (systemBack) {
+            if (screen == ShelfScreen::Home) {
+                running = false;
+            } else {
+                screen = ShelfScreen::Home;
+                ClearBackInput();
+            }
+        }
+
         SDL_Event event{};
 
-        while (SDL_PollEvent(&event)) {
+        while (running && SDL_PollEvent(&event)) {
             if (event.type == SDL_QUIT) {
                 running = false;
             }
@@ -1092,6 +1369,7 @@ bool PickGame(GameEntry& selected, std::string& diagnostic) {
                         screen = ShelfScreen::Library;
                     } else if (homeSelection == 1) {
                         ShowTransferScreen(renderer);
+                        ClearBackInput();
                         games = ScanGames(diagnostic);
                         gameSelection = 0;
                     } else {
@@ -1109,6 +1387,9 @@ bool PickGame(GameEntry& selected, std::string& diagnostic) {
             if (screen == ShelfScreen::About) {
                 if (back || confirm) {
                     screen = ShelfScreen::Home;
+                    if (back) {
+                        ClearBackInput();
+                    }
                 }
                 continue;
             }
@@ -1130,7 +1411,10 @@ bool PickGame(GameEntry& selected, std::string& diagnostic) {
             if (confirm && !games.empty()) {
                 if (Is64BitGame(games[gameSelection])) {
                     diagnostic =
-                        "64-BIT GAME DETECTED - XBOXWINE64 IS NOT READY YET";
+                        "X64 DETECTED - CURRENT ENGINE IS BOXEDWINE32";
+                } else if (!Is32BitGame(games[gameSelection])) {
+                    diagnostic =
+                        "UNKNOWN ARCHITECTURE - REUPLOAD WITH THE NEW UPLOADER";
                 } else {
                     selected = games[gameSelection];
                     accepted = true;
@@ -1145,6 +1429,30 @@ bool PickGame(GameEntry& selected, std::string& diagnostic) {
                 !games.empty()
             ) {
                 EditControls(renderer, games[gameSelection], diagnostic);
+                ClearBackInput();
+            }
+
+            if (
+                ((event.type == SDL_KEYDOWN &&
+                  event.key.keysym.sym == SDLK_F6) ||
+                 ControllerPressed(
+                     event,
+                     SDL_CONTROLLER_BUTTON_RIGHTSHOULDER
+                 )) &&
+                !games.empty()
+            ) {
+                GameEntry runtimeSelection;
+                if (ShowRuntimeMenu(
+                        renderer,
+                        games[gameSelection],
+                        runtimeSelection,
+                        diagnostic
+                    )) {
+                    selected = runtimeSelection;
+                    accepted = true;
+                    running = false;
+                }
+                ClearBackInput();
             }
 
             if (
@@ -1162,6 +1470,7 @@ bool PickGame(GameEntry& selected, std::string& diagnostic) {
                 ControllerPressed(event, SDL_CONTROLLER_BUTTON_Y)
             ) {
                 ShowTransferScreen(renderer);
+                ClearBackInput();
                 games = ScanGames(diagnostic);
                 gameSelection = 0;
             }
@@ -1177,6 +1486,7 @@ bool PickGame(GameEntry& selected, std::string& diagnostic) {
             if (back) {
                 // B leaves the Library, not the entire application.
                 screen = ShelfScreen::Home;
+                ClearBackInput();
             }
         }
 
@@ -1373,7 +1683,7 @@ bool PickGame(GameEntry& selected, std::string& diagnostic) {
                 renderer,
                 84,
                 488,
-                "XBOXWINE64 - RUNTIME PACKS - KINECT LAB - EMULATOR ENGINES",
+                "VC++ X86 RUNTIME - GAME REDISTS - XBOXWINE64 RESEARCH",
                 2,
                 warning
             );
@@ -1444,15 +1754,15 @@ bool PickGame(GameEntry& selected, std::string& diagnostic) {
                     renderer,
                     card.x + 550,
                     card.y + 20,
-                    Is64BitGame(games[gameIndex])
-                        ? "X64"
-                        : "X86",
+                    ArchitectureShortLabel(games[gameIndex]),
                     2,
                     chosen
                         ? SDL_Color{5, 15, 26, 255}
                         : (Is64BitGame(games[gameIndex])
                             ? warning
-                            : good)
+                            : (Is32BitGame(games[gameIndex])
+                                ? good
+                                : muted))
                 );
             }
 
@@ -1493,13 +1803,22 @@ bool PickGame(GameEntry& selected, std::string& diagnostic) {
                     white
                 );
 
-                DrawText(renderer, 864, 528, "DETECTED KEYS", 2, muted);
+                DrawText(renderer, 864, 520, "DETECTED KEYS", 2, muted);
                 DrawText(
                     renderer,
                     864,
-                    560,
+                    550,
                     std::to_string(game.detectedKeys.size()),
-                    4,
+                    3,
+                    accent
+                );
+                DrawText(renderer, 1010, 520, "RUNTIMES", 2, muted);
+                DrawText(
+                    renderer,
+                    1010,
+                    550,
+                    std::to_string(game.runtimeInstallers.size()),
+                    3,
                     accent
                 );
             } else {
@@ -1527,10 +1846,11 @@ bool PickGame(GameEntry& selected, std::string& diagnostic) {
             }
 
             DrawButtonHint(renderer, 42, 676, "A", "PLAY", accent, white);
-            DrawButtonHint(renderer, 198, 676, "X", "CONTROLS", panelSoft, white);
-            DrawButtonHint(renderer, 430, 676, "Y", "ADD GAME", panelSoft, white);
-            DrawButtonHint(renderer, 640, 676, "B", "HOME", panelSoft, white);
-            DrawText(renderer, 918, 684, "VIEW  NEXT EXE", 2, muted);
+            DrawButtonHint(renderer, 190, 676, "X", "CONTROLS", panelSoft, white);
+            DrawButtonHint(renderer, 414, 676, "Y", "ADD", panelSoft, white);
+            DrawButtonHint(renderer, 558, 676, "RB", "RUNTIMES", panelSoft, white);
+            DrawButtonHint(renderer, 808, 676, "B", "HOME", panelSoft, white);
+            DrawText(renderer, 1040, 684, "VIEW EXE", 2, muted);
         }
 
         SDL_RenderPresent(renderer);
