@@ -27,7 +27,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: work/boxedwine
-          key: boxedwine-core-uwpcompat-sdl2285-v2-imgui-null-fix
+          key: boxedwine-core-uwpcompat-sdl2285-v3-safe-reset
           restore-keys: |
             boxedwine-uwp-fast-v4-
             boxedwine-uwp-windows2022-x64-
@@ -94,11 +94,11 @@ jobs:
               "project\msvc\BoxedWine\uwp\Package.appxmanifest"
 
           $manifestText = Get-Content -Raw $manifestPath
-          if (-not $manifestText.Contains('Version="0.2.9.2"')) {
-              throw "Manifest version verification failed. Expected 0.2.9.2."
+          if (-not $manifestText.Contains('Version="0.2.9.3"')) {
+              throw "Manifest version verification failed. Expected 0.2.9.3."
           }
 
-          Write-Host "Verified package identity version 0.2.9.2."
+          Write-Host "Verified package identity version 0.2.9.3."
 
       - name: Build official SDL2 UWP renderer
         shell: pwsh
@@ -243,7 +243,54 @@ jobs:
           path: work/sdl2-uwp
           key: sdl2-uwp-release-2.28.5-v143-x64-v1
 
-      - name: Compile changed UWP sources
+      - name: Verify patched core source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $mainUi = Join-Path `
+              $env:BOXEDWINE_ROOT `
+              "source\ui\mainui.cpp"
+          $nativeScreen = Join-Path `
+              $env:BOXEDWINE_ROOT `
+              "platform\sdl\knativescreenSDL.cpp"
+
+          $mainUiText = Get-Content -Raw $mainUi
+          $nativeScreenText = Get-Content -Raw $nativeScreen
+
+          if (-not $mainUiText.Contains("XBOXWINE_SAFE_RESET_CONTEXT_V3")) {
+              throw "Safe resetContext marker is missing before compilation."
+          }
+
+          if (-not $mainUiText.Contains("ImGui::GetCurrentContext()")) {
+              throw "resetContext is not guarded by ImGui::GetCurrentContext()."
+          }
+
+          if (-not $nativeScreenText.Contains("XBOXWINE_DIRECT3D11_RENDERER_V3")) {
+              throw "Direct3D 11 BoxedWine renderer marker is missing."
+          }
+
+          if ($nativeScreenText.Contains("skip resetContext without BoxedWine ImGui UI")) {
+              throw "The ineffective v0.2.9.2 resetContext wrapper is still present."
+          }
+
+          New-Item -ItemType Directory -Force ".\logs" | Out-Null
+
+          Get-Content $mainUi |
+              Select-String `
+                  -Pattern "resetContext|XBOXWINE_SAFE_RESET_CONTEXT_V3|GetCurrentContext" `
+                  -Context 3,18 |
+              Out-File ".\logs\patched-resetContext.txt"
+
+          Get-Content $nativeScreen |
+              Select-String `
+                  -Pattern "destroyMainWindow|XBOXWINE_DIRECT3D11_RENDERER_V3|SDL_CreateRenderer" `
+                  -Context 3,24 |
+              Out-File ".\logs\patched-native-screen.txt"
+
+          Write-Host "Patched core source verification passed."
+
+      - name: Rebuild fixed BoxedWine core
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -254,78 +301,69 @@ jobs:
               $env:BOXEDWINE_ROOT `
               "project\msvc\BoxedWine"
           $solution = Join-Path $solutionDir "BoxedWine.sln"
-          $project = Join-Path $solutionDir "uwp\uwp.vcxproj"
 
-          $boxedLibrary = Get-ChildItem `
+          # Source-level core patches must never be hidden by restored .obj files.
+          Get-ChildItem `
               $solutionDir `
               -Recurse `
-              -Filter "BoxedWine.lib" `
+              -Directory `
               -ErrorAction SilentlyContinue |
               Where-Object {
-                  $_.FullName -match "[\\/]x64[\\/]" -and
-                  $_.FullName -match "[\\/]Release[\\/]"
+                  $_.FullName -match "[\\/]x64[\\/]Release"
               } |
-              Select-Object -First 1
-
-          $uwpLibrary = Get-ChildItem `
-              $solutionDir `
-              -Recurse `
-              -Filter "libuwp.lib" `
-              -ErrorAction SilentlyContinue |
-              Where-Object {
-                  $_.FullName -match "[\\/]x64[\\/]" -and
-                  $_.FullName -match "[\\/]Release[\\/]"
-              } |
-              Select-Object -First 1
-
-          if ($boxedLibrary -and $uwpLibrary) {
-              Write-Host "Reusing cached BoxedWine dependency libraries:"
-              $boxedLibrary, $uwpLibrary |
-                  Select-Object FullName, Length
-
-              Write-Host "Compiling changed XboxWine C++ sources before packaging."
-
-              msbuild.exe $project `
-                  /m `
-                  /t:ClCompile `
-                  /p:Configuration=Release `
-                  /p:Platform=x64 `
-                  /p:BuildProjectReferences=false `
-                  "/p:SolutionDir=$solutionDir\" `
-                  /p:GenerateAppxPackageOnBuild=false `
-                  /p:AppxPackageSigningEnabled=false `
-                  /p:AppxBundle=Never `
-                  /bl:".\logs\source-check.binlog"
-
-              if ($LASTEXITCODE -ne 0) {
-                  throw "XboxWine C++ source check failed with exit code $LASTEXITCODE."
+              ForEach-Object {
+                  Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
               }
-          } else {
-              Write-Host "No fixed-core cache was found."
-              Write-Host "This v0.2.9.2 run must rebuild BoxedWine once so the ImGui launch fix is compiled."
 
-              msbuild.exe $solution `
-                  /m `
-                  /restore `
-                  /t:Build `
-                  /p:Configuration=Release `
-                  /p:Platform=x64 `
-                  /p:GenerateAppxPackageOnBuild=false `
-                  /p:AppxPackageSigningEnabled=false `
-                  /p:AppxBundle=Never `
-                  /bl:".\logs\first-core-build.binlog"
+          msbuild.exe $solution `
+              /m `
+              /restore `
+              /t:Rebuild `
+              /p:Configuration=Release `
+              /p:Platform=x64 `
+              /p:GenerateAppxPackageOnBuild=false `
+              /p:AppxPackageSigningEnabled=false `
+              /p:AppxBundle=Never `
+              /bl:".\logs\fixed-core-rebuild.binlog"
 
-              if ($LASTEXITCODE -ne 0) {
-                  throw "Initial BoxedWine dependency build failed with exit code $LASTEXITCODE."
-              }
+          if ($LASTEXITCODE -ne 0) {
+              throw "Fixed BoxedWine core rebuild failed with exit code $LASTEXITCODE."
           }
+
+          $uwpExe = Get-ChildItem `
+              $solutionDir `
+              -Recurse `
+              -Filter "uwp.exe" |
+              Where-Object {
+                  $_.FullName -match "[\\/]x64[\\/]Release[\\/]"
+              } |
+              Sort-Object LastWriteTime -Descending |
+              Select-Object -First 1
+
+          if (-not $uwpExe) {
+              throw "The rebuilt UWP executable was not found."
+          }
+
+          # findstr works on embedded ASCII diagnostic strings.
+          & findstr.exe `
+              /M `
+              /C:"XBOXWINE_SAFE_RESET_CONTEXT_V3" `
+              $uwpExe.FullName *> $null
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "The final uwp.exe does not contain the safe resetContext marker."
+          }
+
+          Write-Host "Verified fixed marker inside final uwp.exe."
+          Get-Item $uwpExe.FullName |
+              Select-Object FullName, Length, LastWriteTime
 
       - name: Save compiled BoxedWine core cache
         if: steps.boxedwine-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: work/boxedwine
-          key: boxedwine-core-uwpcompat-sdl2285-v2-imgui-null-fix
+          key: boxedwine-core-uwpcompat-sdl2285-v3-safe-reset
 
       - name: Restore Wine runtime cache
         id: wine-runtime-cache
@@ -573,20 +611,20 @@ jobs:
           $bundle = Get-ChildItem `
               $packageFolder `
               -Recurse `
-              -Filter "*0.2.9.2*x64*.msixbundle" |
+              -Filter "*0.2.9.3*x64*.msixbundle" |
               Select-Object -First 1
 
           if (-not $bundle) {
-              throw "A v0.2.9.2 x64 MSIX bundle was not produced."
+              throw "A v0.2.9.3 x64 MSIX bundle was not produced."
           }
 
           @"
-          XboxWine Shelf v0.2.9.2
-          ImGui null-context launch fix / Direct3D 11 / x86 smoke test
+          XboxWine Shelf v0.2.9.3
+          Safe ImGui reset / guarded SDL startup / x86 smoke test
           GitHub run: $env:GITHUB_RUN_NUMBER
           Commit: $env:GITHUB_SHA
           "@ | Set-Content `
-              (Join-Path $packageFolder "THIS-IS-XBOXWINE-v0.2.9.2.txt") `
+              (Join-Path $packageFolder "THIS-IS-XBOXWINE-v0.2.9.3.txt") `
               -Encoding UTF8
 
           Get-ChildItem $packageFolder -Recurse |
@@ -595,10 +633,17 @@ jobs:
       - name: Upload Xbox package
         uses: actions/upload-artifact@v7
         with:
-          name: XboxWine-Shelf-v0.2.9.2-x64
+          name: XboxWine-Shelf-v0.2.9.3-x64
           path: artifacts/AppPackages/
           if-no-files-found: error
           compression-level: 0
+
+      - name: Upload matching PC uploader
+        uses: actions/upload-artifact@v7
+        with:
+          name: XboxWine-PC-Uploader-v0.2.9.3
+          path: xboxwine_uploader.py
+          if-no-files-found: error
 
       - name: Upload diagnostic logs
         if: always()

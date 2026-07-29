@@ -26,8 +26,12 @@ from tkinter import filedialog, messagebox, ttk
 from urllib.request import Request, urlopen
 import zipfile
 
+APP_VERSION = "0.2.9.3"
 PORT = 24872
 MAGIC = b"XWUP2\0\0\0"
+CONNECT_TIMEOUT_SECONDS = 12
+TRANSFER_TIMEOUT_SECONDS = 20 * 60
+TRANSFER_CHUNK_BYTES = 256 * 1024
 MAX_SCAN_BYTES = 96 * 1024 * 1024
 VC_REDIST_X86_URL = "https://aka.ms/vc14/vc_redist.x86.exe"
 
@@ -98,18 +102,40 @@ def make_work_folder() -> Path:
 
 
 def download_file(url: str, output: Path, progress=None) -> None:
-    request = Request(url, headers={"User-Agent": "XboxWine-Uploader/0.2.9"})
-    with urlopen(request, timeout=60) as response, output.open("wb") as stream:
-        total = int(response.headers.get("Content-Length") or 0)
-        completed = 0
-        while True:
-            chunk = response.read(1024 * 1024)
-            if not chunk:
-                break
-            stream.write(chunk)
-            completed += len(chunk)
-            if progress:
-                progress("Downloading VC++ x86 runtime", completed, max(total, 1))
+    request = Request(
+        url,
+        headers={"User-Agent": f"XboxWine-Uploader/{APP_VERSION}"},
+    )
+
+    try:
+        with urlopen(request, timeout=120) as response, output.open("wb") as stream:
+            total = int(response.headers.get("Content-Length") or 0)
+            completed = 0
+
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+
+                stream.write(chunk)
+                completed += len(chunk)
+
+                if progress:
+                    progress(
+                        "Downloading VC++ x86 runtime",
+                        completed,
+                        max(total, 1),
+                    )
+    except (TimeoutError, socket.timeout) as error:
+        raise RuntimeError(
+            "The Microsoft VC++ runtime download timed out. "
+            "Uncheck the runtime option and retry the game transfer. "
+            "This timeout happened before connecting to the Xbox."
+        ) from error
+    except OSError as error:
+        raise RuntimeError(
+            f"The VC++ runtime could not be downloaded: {error}"
+        ) from error
 
 
 def find_runtime_installers(root: Path) -> dict[str, tuple[Path, str]]:
@@ -446,30 +472,137 @@ def send_game(
     archive_size = archive_path.stat().st_size
     header = struct.pack("<8sIQ", MAGIC, len(metadata), archive_size)
 
-    with socket.create_connection((xbox_ip, port), timeout=15) as connection:
-        connection.settimeout(120)
-        connection.sendall(header)
-        connection.sendall(metadata)
+    if progress:
+        progress("Connecting to Xbox", 0, 1)
+
+    connection: socket.socket | None = None
+
+    try:
+        last_error: OSError | None = None
+
+        for attempt in range(1, 4):
+            try:
+                connection = socket.create_connection(
+                    (xbox_ip, port),
+                    timeout=CONNECT_TIMEOUT_SECONDS,
+                )
+                break
+            except (TimeoutError, socket.timeout, ConnectionRefusedError, OSError) as error:
+                last_error = error
+
+                if attempt < 3:
+                    if progress:
+                        progress(
+                            f"Xbox connection attempt {attempt} failed; retrying",
+                            attempt,
+                            3,
+                        )
+                    time.sleep(1.5)
+
+        if connection is None:
+            detail = f" ({last_error})" if last_error else ""
+            raise RuntimeError(
+                "Could not connect to XboxWine at "
+                f"{xbox_ip}:{port}{detail}. "
+                "Keep XboxWine open in the foreground on its transfer screen, "
+                "confirm the displayed IP address has not changed, and make sure "
+                "the PC and Xbox are on the same local network."
+            )
+
+        connection.settimeout(TRANSFER_TIMEOUT_SECONDS)
+        connection.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+
+        try:
+            connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
+
+        if progress:
+            progress("Sending upload header", 0, 1)
+
+        try:
+            connection.sendall(header)
+            connection.sendall(metadata)
+        except (TimeoutError, socket.timeout) as error:
+            raise RuntimeError(
+                "Connected to XboxWine, but the Xbox timed out while reading "
+                "the upload header. Return to the transfer screen and retry."
+            ) from error
+        except OSError as error:
+            raise RuntimeError(
+                f"The Xbox connection closed while sending the upload header: {error}"
+            ) from error
+
         sent = 0
-        with archive_path.open("rb") as stream:
-            while True:
-                chunk = stream.read(1024 * 1024)
-                if not chunk:
-                    break
-                connection.sendall(chunk)
-                sent += len(chunk)
-                if progress:
-                    progress("Sending to Xbox", sent, max(archive_size, 1))
-        reply = connection.recv(4096).decode("utf-8", errors="replace").strip()
-    if not reply.startswith("OK"):
-        raise RuntimeError(reply or "The Xbox closed the connection without a reply.")
-    return reply
+
+        try:
+            with archive_path.open("rb") as stream:
+                while True:
+                    chunk = stream.read(TRANSFER_CHUNK_BYTES)
+                    if not chunk:
+                        break
+
+                    connection.sendall(chunk)
+                    sent += len(chunk)
+
+                    if progress:
+                        progress(
+                            "Sending game folder to Xbox",
+                            sent,
+                            max(archive_size, 1),
+                        )
+        except (TimeoutError, socket.timeout) as error:
+            raise RuntimeError(
+                "The Xbox stopped receiving the game folder for 20 minutes. "
+                f"Sent {sent:,} of {archive_size:,} bytes. "
+                "Keep XboxWine open in the foreground and prevent the Xbox "
+                "from returning to Dev Home during the transfer."
+            ) from error
+        except OSError as error:
+            raise RuntimeError(
+                "The network connection was interrupted while sending the game "
+                f"folder after {sent:,} of {archive_size:,} bytes: {error}"
+            ) from error
+
+        if progress:
+            progress("Waiting for Xbox to save the upload", 0, 1)
+
+        try:
+            reply_bytes = connection.recv(4096)
+        except (TimeoutError, socket.timeout) as error:
+            raise RuntimeError(
+                "The complete folder was sent, but XboxWine did not reply within "
+                "20 minutes. Read the status message shown on the Xbox transfer "
+                "screen; it may be stuck saving the archive."
+            ) from error
+        except OSError as error:
+            raise RuntimeError(
+                f"The Xbox closed the connection before sending a result: {error}"
+            ) from error
+
+        reply = reply_bytes.decode("utf-8", errors="replace").strip()
+
+        if not reply:
+            raise RuntimeError(
+                "The Xbox closed the connection without returning an upload result."
+            )
+
+        if not reply.startswith("OK"):
+            raise RuntimeError(reply)
+
+        return reply
+    finally:
+        if connection is not None:
+            try:
+                connection.close()
+            except OSError:
+                pass
 
 
 class UploaderApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("XboxWine Folder Uploader")
+        self.root.title(f"XboxWine Folder Uploader v{APP_VERSION}")
         self.root.minsize(720, 500)
         self.folder: Path | None = None
         self.candidates: list[tuple[Path, str, int]] = []
@@ -506,24 +639,77 @@ class UploaderApp:
         ttk.Label(frame, text="Executable").grid(row=3, column=0, sticky="w", pady=6)
         self.exe_var = tk.StringVar()
         self.exe_combo = ttk.Combobox(frame, textvariable=self.exe_var, state="readonly")
-        self.exe_combo.grid(row=3, column=1, columnspan=2, sticky="ew", pady=6)
+        self.exe_combo.grid(row=3, column=1, sticky="ew", pady=6)
+        self.exe_combo.bind("<<ComboboxSelected>>", self.on_executable_changed)
 
-        ttk.Label(frame, text="Detected keys").grid(row=4, column=0, sticky="nw", pady=6)
+        self.architecture_var = tk.StringVar(value="Architecture: not scanned")
+        ttk.Label(frame, textvariable=self.architecture_var).grid(
+            row=3,
+            column=2,
+            sticky="w",
+            padx=(8, 0),
+            pady=6,
+        )
+
+        self.include_vc_var = tk.BooleanVar(value=False)
+        self.runtime_checkbox = ttk.Checkbutton(
+            frame,
+            text="Include Microsoft VC++ 2015-2022 x86 runtime",
+            variable=self.include_vc_var,
+        )
+        self.runtime_checkbox.grid(
+            row=4,
+            column=1,
+            columnspan=2,
+            sticky="w",
+            pady=(4, 6),
+        )
+
+        ttk.Label(frame, text="Detected keys").grid(row=5, column=0, sticky="nw", pady=6)
         self.keys_text = tk.Text(frame, height=6, wrap="word", state="disabled")
-        self.keys_text.grid(row=4, column=1, columnspan=2, sticky="nsew", pady=6)
-        frame.rowconfigure(4, weight=1)
+        self.keys_text.grid(row=5, column=1, columnspan=2, sticky="nsew", pady=6)
+        frame.rowconfigure(5, weight=1)
 
-        self.status_var = tk.StringVar(value="Open XboxWine Shelf and press Y, then choose a folder here.")
+        self.status_var = tk.StringVar(value="Open XboxWine v0.2.9.2, press Y, then choose a folder here.")
         ttk.Label(frame, textvariable=self.status_var, wraplength=650).grid(
-            row=5, column=0, columnspan=3, sticky="ew", pady=(14, 6)
+            row=6, column=0, columnspan=3, sticky="ew", pady=(14, 6)
         )
         self.progress = ttk.Progressbar(frame, maximum=100)
-        self.progress.grid(row=6, column=0, columnspan=3, sticky="ew", pady=6)
+        self.progress.grid(row=7, column=0, columnspan=3, sticky="ew", pady=6)
 
         self.send_button = ttk.Button(frame, text="Send folder to Xbox", command=self.start_send)
-        self.send_button.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(12, 0))
+        self.send_button.grid(row=8, column=0, columnspan=3, sticky="ew", pady=(12, 0))
+
+        ttk.Label(
+            frame,
+            text=f"Uploader v{APP_VERSION} • XWUP2 • 20-minute LAN timeout",
+        ).grid(
+            row=9,
+            column=0,
+            columnspan=3,
+            sticky="e",
+            pady=(8, 0),
+        )
 
         self.root.after(100, self.poll_events)
+
+    def on_executable_changed(self, _event=None) -> None:
+        index = self.exe_combo.current()
+
+        if index < 0 or index >= len(self.candidates):
+            self.architecture_var.set("Architecture: unknown")
+            self.include_vc_var.set(False)
+            self.runtime_checkbox.state(["disabled"])
+            return
+
+        _path, architecture, _score = self.candidates[index]
+        self.architecture_var.set(f"Architecture: {architecture}")
+
+        if architecture == "x86":
+            self.runtime_checkbox.state(["!disabled"])
+        else:
+            self.include_vc_var.set(False)
+            self.runtime_checkbox.state(["disabled"])
 
     def choose_folder(self) -> None:
         selected = filedialog.askdirectory(title="Choose the complete game folder")
@@ -549,7 +735,11 @@ class UploaderApp:
         if self.folder is None or not self.candidates:
             messagebox.showerror("XboxWine", "Choose a folder containing an .exe first.")
             return
-        xbox_ip = self.ip_var.get().strip().split(":", 1)[0]
+        xbox_ip = self.ip_var.get().strip()
+        xbox_ip = re.sub(r"^https?://", "", xbox_ip, flags=re.IGNORECASE)
+        xbox_ip = xbox_ip.split("/", 1)[0]
+        xbox_ip = xbox_ip.rsplit(":", 1)[0].strip()
+
         if not xbox_ip:
             messagebox.showerror("XboxWine", "Enter the Xbox IP shown in the transfer screen.")
             return
@@ -652,11 +842,15 @@ class UploaderApp:
                     self.exe_combo["values"] = labels
                     if labels:
                         self.exe_combo.current(0)
+                        self.on_executable_changed()
                         self.status_var.set(
                             f"Found {len(labels)} executable(s). The best candidate is selected."
                         )
                         self.send_button.state(["!disabled"])
                     else:
+                        self.architecture_var.set("Architecture: none")
+                        self.include_vc_var.set(False)
+                        self.runtime_checkbox.state(["disabled"])
                         self.status_var.set("No .exe files were found in that folder.")
                     self.keys_text.configure(state="normal")
                     self.keys_text.delete("1.0", "end")

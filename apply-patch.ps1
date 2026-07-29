@@ -69,94 +69,254 @@ elseif (-not $nativeSystem.Contains("boxedwine_standalone_main_disabled")) {
 }
 
 
-# XboxWine launch crash fix:
-# The experimental UWP fork calls resetContext() while creating the first
-# BoxedWine window. XboxWine launches boxedmain() directly and never creates
-# BoxedWine's ImGui UI context, so resetContext() reaches
-# ImGui::DestroyContext(nullptr) -> ImGui::Shutdown(nullptr) and crashes.
+# XboxWine v0.2.9.3 stability fix.
+#
+# The matching 0.2.9.1 and 0.2.9.3 dumps have an identical crash:
+# ImGui::Shutdown(nullptr) <- resetContext() <- recreateMainWindow().
+#
+# Do not depend on BOXEDWINE_UWP being defined in the BoxedWine static-library
+# project. Guard the resetContext implementation itself instead.
+
+$mainUiPath = Join-Path $RepoRoot "source\ui\mainui.cpp"
+if (-not (Test-Path $mainUiPath)) {
+    throw "Could not locate BoxedWine UI source: $mainUiPath"
+}
+
+$mainUi = [System.IO.File]::ReadAllText($mainUiPath)
+$safeResetMarker = "XBOXWINE_SAFE_RESET_CONTEXT_V3"
+
+if (-not $mainUi.Contains($safeResetMarker)) {
+    $resetFunctionPattern = '(?s)void\s+resetContext\s*\(\s*\)\s*\{\s*ImGui_ImplOpenGL3_Shutdown\s*\(\s*\)\s*;\s*SDL_GL_DeleteContext\s*\(\s*gl_context\s*\)\s*;\s*ImGui_ImplSDL2_Shutdown\s*\(\s*\)\s*;\s*ImGui::DestroyContext\s*\(\s*\)\s*;\s*appRunning\s*=\s*true\s*;\s*\}'
+
+    $safeResetFunction = @'
+void resetContext() {
+    // XBOXWINE_SAFE_RESET_CONTEXT_V3
+    //
+    // XboxWine enters boxedmain() directly, without first creating
+    // BoxedWine's ImGui launcher UI. The old code unconditionally called
+    // ImGui::DestroyContext(), which dereferenced a null ImGuiContext.
+    ImGuiContext* context = ImGui::GetCurrentContext();
+
+    if (context != nullptr) {
+        ImGui_ImplOpenGL3_Shutdown();
+
+        if (gl_context != nullptr) {
+            SDL_GL_DeleteContext(gl_context);
+            gl_context = nullptr;
+        }
+
+        ImGui_ImplSDL2_Shutdown();
+        ImGui::DestroyContext(context);
+    } else {
+        klog("XBOXWINE_SAFE_RESET_CONTEXT_V3: no ImGui context; skipping shutdown");
+    }
+
+    appRunning = true;
+}
+'@
+
+    $mainUiAfter = [System.Text.RegularExpressions.Regex]::Replace(
+        $mainUi,
+        $resetFunctionPattern,
+        $safeResetFunction,
+        1
+    )
+
+    if ($mainUiAfter -eq $mainUi) {
+        throw "Could not replace BoxedWine resetContext()."
+    }
+
+    $mainUi = $mainUiAfter
+}
+
+if (-not $mainUi.Contains($safeResetMarker)) {
+    throw "The guarded resetContext implementation was not installed."
+}
+
+[System.IO.File]::WriteAllText(
+    $mainUiPath,
+    $mainUi,
+    [System.Text.UTF8Encoding]::new($false)
+)
+
+# Replace the ineffective v0.2.9.3 call-site preprocessor wrapper, when it is
+# present in a restored cache, with one normal call to the now-safe function.
 $nativeScreenPath = Join-Path $RepoRoot "platform\sdl\knativescreenSDL.cpp"
 if (-not (Test-Path $nativeScreenPath)) {
     throw "Could not locate BoxedWine screen source: $nativeScreenPath"
 }
 
 $nativeScreen = [System.IO.File]::ReadAllText($nativeScreenPath)
-$launchFixMarker = "XBOXWINE: skip resetContext without BoxedWine ImGui UI"
 
-if (-not $nativeScreen.Contains($launchFixMarker)) {
-    $resetPattern = '(?m)^(?<indent>[ \t]*)resetContext\(\);[^\r\n]*$'
-    $resetMatch = [System.Text.RegularExpressions.Regex]::Match(
-        $nativeScreen,
-        $resetPattern
-    )
+$oldCallSitePattern = '(?s)#if\s+!defined\s*\(\s*BOXEDWINE_UWP\s*\)\s*resetContext\s*\(\s*\)\s*;\s*#else\s*//\s*XBOXWINE:\s*skip\s*resetContext\s*without\s*BoxedWine\s*ImGui\s*UI\s*#endif'
+$nativeScreen = [System.Text.RegularExpressions.Regex]::Replace(
+    $nativeScreen,
+    $oldCallSitePattern,
+    'resetContext(); // XBOXWINE: guarded by XBOXWINE_SAFE_RESET_CONTEXT_V3',
+    1
+)
 
-    if (-not $resetMatch.Success) {
-        throw "Could not locate resetContext() in KNativeScreenSDL::recreateMainWindow()."
+# Correct SDL destruction order and clear stale pointers.
+$destroyFunctionPattern = '(?s)void\s+KNativeScreenSDL::destroyMainWindow\s*\(\s*\)\s*\{.*?\n\}'
+$safeDestroyFunction = @'
+void KNativeScreenSDL::destroyMainWindow() {
+    destroyTextureCache();
+
+#ifdef BOXEDWINE_UWP
+    if (this->cursorTexture) {
+        SDL_DestroyTexture(this->cursorTexture);
+        this->cursorTexture = nullptr;
+    }
+#endif
+
+    if (renderer) {
+        SDL_DestroyRenderer(renderer);
+        renderer = nullptr;
     }
 
-    $indent = $resetMatch.Groups["indent"].Value
-    $replacement = @(
-        "${indent}#if !defined(BOXEDWINE_UWP)",
-        "${indent}resetContext();",
-        "${indent}#else",
-        "${indent}// XBOXWINE: skip resetContext without BoxedWine ImGui UI",
-        "${indent}#endif"
-    ) -join [Environment]::NewLine
+    if (window) {
+        SDL_DestroyWindow(window);
+        window = nullptr;
+    }
+}
+'@
 
-    $nativeScreen = $nativeScreen.Remove(
-        $resetMatch.Index,
-        $resetMatch.Length
-    ).Insert(
-        $resetMatch.Index,
-        $replacement
+$nativeScreenAfter = [System.Text.RegularExpressions.Regex]::Replace(
+    $nativeScreen,
+    $destroyFunctionPattern,
+    $safeDestroyFunction,
+    1
+)
+
+if ($nativeScreenAfter -eq $nativeScreen -and
+    -not $nativeScreen.Contains("renderer = nullptr;")) {
+    throw "Could not replace KNativeScreenSDL::destroyMainWindow()."
+}
+
+$nativeScreen = $nativeScreenAfter
+
+# Make the UWP renderer choice explicit and stop immediately when SDL cannot
+# create the first window or renderer.
+$windowCreateLine = 'window = SDL_CreateWindow("BoxedWine", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, cx, cy, flags);'
+if ($nativeScreen.Contains($windowCreateLine) -and
+    -not $nativeScreen.Contains("XBOXWINE_DIRECT3D11_RENDERER_V3")) {
+    $windowReplacement = @'
+        // XBOXWINE_DIRECT3D11_RENDERER_V3
+        SDL_SetHint(SDL_HINT_RENDER_DRIVER, "direct3d11");
+        window = SDL_CreateWindow("BoxedWine", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, cx, cy, flags);
+'@
+    $nativeScreen = $nativeScreen.Replace(
+        "        $windowCreateLine",
+        $windowReplacement
     )
 }
 
-# Also clean up SDL objects in dependency order and clear their pointers.
-# This prevents stale renderer/window/texture pointers during later recreation.
-$destroyPattern = '(?s)(?<indent>[ \t]*)if\s*\(\s*renderer\s*\)\s*\{\s*SDL_DestroyRenderer\s*\(\s*renderer\s*\)\s*;\s*\}\s*if\s*\(\s*window\s*\)\s*\{\s*SDL_DestroyWindow\s*\(\s*window\s*\)\s*;\s*\}\s*#ifdef\s+BOXEDWINE_UWP\s*if\s*\(\s*this->cursorTexture\s*\)\s*\{\s*SDL_DestroyTexture\s*\(\s*this->cursorTexture\s*\)\s*;\s*\}\s*#endif'
-$destroyFixMarker = "XBOXWINE: clear SDL object pointers after destruction"
+$oldWindowFailure = @'
+        if (!window) {
+            klog("SDL_CreateWindow failed: %s", SDL_GetError());
+        }
+'@
+$newWindowFailure = @'
+        if (!window) {
+            klog("SDL_CreateWindow failed: %s", SDL_GetError());
+            return;
+        }
+'@
+$nativeScreen = $nativeScreen.Replace(
+    $oldWindowFailure,
+    $newWindowFailure
+)
 
-if (-not $nativeScreen.Contains($destroyFixMarker)) {
-    $destroyMatch = [System.Text.RegularExpressions.Regex]::Match(
-        $nativeScreen,
-        $destroyPattern
-    )
+$oldRendererFallback = @'
+        renderer = SDL_CreateRenderer(window, -1, flags);
+        if (!renderer) {
+            klog("Failed to create SDL accelerated renderer, will try software");
+            flags &= ~SDL_RENDERER_ACCELERATED;
+            flags |= SDL_RENDERER_SOFTWARE;
+            renderer = SDL_CreateRenderer(window, -1, flags);
+        }
+'@
+$newRendererFallback = @'
+        renderer = SDL_CreateRenderer(window, -1, flags);
+        if (!renderer) {
+            klog("Failed to create SDL accelerated renderer, will try software");
+            flags &= ~SDL_RENDERER_ACCELERATED;
+            flags |= SDL_RENDERER_SOFTWARE;
+            renderer = SDL_CreateRenderer(window, -1, flags);
+        }
+        if (!renderer) {
+            klog("SDL_CreateRenderer failed: %s", SDL_GetError());
+            SDL_DestroyWindow(window);
+            window = nullptr;
+            return;
+        }
+'@
+$nativeScreen = $nativeScreen.Replace(
+    $oldRendererFallback,
+    $newRendererFallback
+)
 
-    if ($destroyMatch.Success) {
-        $indent = $destroyMatch.Groups["indent"].Value
-        $destroyReplacement = @(
-            "${indent}#ifdef BOXEDWINE_UWP",
-            "${indent}if (this->cursorTexture) {",
-            "${indent}    SDL_DestroyTexture(this->cursorTexture);",
-            "${indent}    this->cursorTexture = nullptr;",
-            "${indent}}",
-            "${indent}#endif",
-            "${indent}if (renderer) {",
-            "${indent}    SDL_DestroyRenderer(renderer);",
-            "${indent}    renderer = nullptr;",
-            "${indent}}",
-            "${indent}if (window) {",
-            "${indent}    SDL_DestroyWindow(window);",
-            "${indent}    window = nullptr;",
-            "${indent}}",
-            "${indent}// XBOXWINE: clear SDL object pointers after destruction"
-        ) -join [Environment]::NewLine
+# Never create a cursor texture using a null renderer or null image data.
+$cursorBlockPattern = '(?s)#ifdef\s+BOXEDWINE_UWP\s*// UWP needs to render it''s own cursor\s*if\s*\(!this->cursorTexture\)\s*\{.*?\}\s*#endif'
+$safeCursorBlock = @'
+#ifdef BOXEDWINE_UWP
+    // UWP needs to render its own cursor.
+    if (renderer && !this->cursorTexture) {
+        int cursorWidth = 0;
+        int cursorHeight = 0;
+        int cursorChannels = 0;
+        unsigned char* cursorData = stbi_load(
+            "pointer_arrow.png",
+            &cursorWidth,
+            &cursorHeight,
+            &cursorChannels,
+            0
+        );
 
-        $nativeScreen = $nativeScreen.Remove(
-            $destroyMatch.Index,
-            $destroyMatch.Length
-        ).Insert(
-            $destroyMatch.Index,
-            $destroyReplacement
-        )
+        if (cursorData && cursorWidth > 0 && cursorHeight > 0) {
+            this->cursorWidth = cursorWidth;
+            this->cursorHeight = cursorHeight;
+            this->cursorTexture = SDL_CreateTexture(
+                renderer,
+                SDL_PIXELFORMAT_RGBA32,
+                SDL_TEXTUREACCESS_STATIC,
+                cursorWidth,
+                cursorHeight
+            );
+
+            if (this->cursorTexture) {
+                SDL_UpdateTexture(
+                    this->cursorTexture,
+                    nullptr,
+                    cursorData,
+                    cursorWidth * cursorChannels
+                );
+                SDL_SetTextureBlendMode(
+                    this->cursorTexture,
+                    SDL_BLENDMODE_BLEND
+                );
+            }
+        }
+
+        if (cursorData) {
+            stbi_image_free(cursorData);
+        }
     }
-    else {
-        Write-Warning "The optional SDL pointer-cleanup block was not found. Continuing with the required ImGui launch fix."
-    }
+#endif
+'@
+
+$nativeScreenAfter = [System.Text.RegularExpressions.Regex]::Replace(
+    $nativeScreen,
+    $cursorBlockPattern,
+    $safeCursorBlock,
+    1
+)
+if ($nativeScreenAfter -ne $nativeScreen) {
+    $nativeScreen = $nativeScreenAfter
 }
 
-if (-not $nativeScreen.Contains($launchFixMarker)) {
-    throw "The BoxedWine ImGui launch-crash fix was not applied."
+if (-not $nativeScreen.Contains("XBOXWINE_DIRECT3D11_RENDERER_V3")) {
+    throw "The Direct3D 11 BoxedWine renderer marker was not installed."
 }
 
 [System.IO.File]::WriteAllText(
@@ -165,7 +325,7 @@ if (-not $nativeScreen.Contains($launchFixMarker)) {
     [System.Text.UTF8Encoding]::new($false)
 )
 
-Write-Host "Patched BoxedWine's null ImGui-context launch crash." -ForegroundColor Green
+Write-Host "Installed XboxWine v0.2.9.3 core stability fixes." -ForegroundColor Green
 
 # Edit the Visual C++ project as XML instead of matching a multiline string.
 # This is resilient to LF/CRLF and harmless whitespace changes in the fork.
@@ -291,12 +451,12 @@ $manifest = $manifest.Replace(
 $manifest = [System.Text.RegularExpressions.Regex]::Replace(
     $manifest,
     '(<Identity\b[^>]*\bVersion=")[^"]+(")',
-    '${1}0.2.9.2${2}',
+    '${1}0.2.9.3${2}',
     1
 )
 
-if (-not $manifest.Contains('Version="0.2.9.2"')) {
-    throw "Failed to set Package.appxmanifest version to 0.2.9.2."
+if (-not $manifest.Contains('Version="0.2.9.3"')) {
+    throw "Failed to set Package.appxmanifest version to 0.2.9.3."
 }
 
 if (-not $manifest.Contains('Name="privateNetworkClientServer"')) {
@@ -312,5 +472,5 @@ if (-not $manifest.Contains('Name="privateNetworkClientServer"')) {
 
 Set-Content -Path $manifestPath -Value $manifest -Encoding UTF8
 
-Write-Host "Patched XboxWine Shelf v0.2.9.2 launch-fix source and Visual Studio project." -ForegroundColor Green
+Write-Host "Patched XboxWine Shelf v0.2.9.3 launch-fix source and Visual Studio project." -ForegroundColor Green
 Write-Host "Original files saved in: $backupDir"
