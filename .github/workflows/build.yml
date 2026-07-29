@@ -6,6 +6,10 @@ on:
     branches:
       - main
 
+concurrency:
+  group: xboxwine-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -23,9 +27,10 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: work/boxedwine
-          key: boxedwine-uwp-fast-v4-${{ hashFiles('apply-patch.ps1', 'patch/uwp/**') }}
+          key: boxedwine-core-uwpcompat-sdl2285-v1
           restore-keys: |
             boxedwine-uwp-fast-v4-
+            boxedwine-uwp-windows2022-x64-
 
       - name: Restore official SDL2 UWP cache
         id: sdl2-cache
@@ -89,11 +94,11 @@ jobs:
               "project\msvc\BoxedWine\uwp\Package.appxmanifest"
 
           $manifestText = Get-Content -Raw $manifestPath
-          if (-not $manifestText.Contains('Version="0.2.9.0"')) {
-              throw "Manifest version verification failed. Expected 0.2.9.0."
+          if (-not $manifestText.Contains('Version="0.2.9.1"')) {
+              throw "Manifest version verification failed. Expected 0.2.9.1."
           }
 
-          Write-Host "Verified package identity version 0.2.9.0."
+          Write-Host "Verified package identity version 0.2.9.1."
 
       - name: Build official SDL2 UWP renderer
         shell: pwsh
@@ -238,7 +243,7 @@ jobs:
           path: work/sdl2-uwp
           key: sdl2-uwp-release-2.28.5-v143-x64-v1
 
-      - name: Fast compile check
+      - name: Compile changed UWP sources
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -250,16 +255,39 @@ jobs:
               "project\msvc\BoxedWine"
           $solution = Join-Path $solutionDir "BoxedWine.sln"
           $project = Join-Path $solutionDir "uwp\uwp.vcxproj"
-          $boxedLibrary = Join-Path `
-              $solutionDir `
-              "x64\Release\BoxedWine\BoxedWine.lib"
 
-          if (Test-Path $boxedLibrary) {
-              Write-Host "Compiling only changed XboxWine UWP sources."
+          $boxedLibrary = Get-ChildItem `
+              $solutionDir `
+              -Recurse `
+              -Filter "BoxedWine.lib" `
+              -ErrorAction SilentlyContinue |
+              Where-Object {
+                  $_.FullName -match "[\\/]x64[\\/]" -and
+                  $_.FullName -match "[\\/]Release[\\/]"
+              } |
+              Select-Object -First 1
+
+          $uwpLibrary = Get-ChildItem `
+              $solutionDir `
+              -Recurse `
+              -Filter "libuwp.lib" `
+              -ErrorAction SilentlyContinue |
+              Where-Object {
+                  $_.FullName -match "[\\/]x64[\\/]" -and
+                  $_.FullName -match "[\\/]Release[\\/]"
+              } |
+              Select-Object -First 1
+
+          if ($boxedLibrary -and $uwpLibrary) {
+              Write-Host "Reusing cached BoxedWine dependency libraries:"
+              $boxedLibrary, $uwpLibrary |
+                  Select-Object FullName, Length
+
+              Write-Host "Compiling changed XboxWine C++ sources before packaging."
 
               msbuild.exe $project `
                   /m `
-                  /t:Build `
+                  /t:ClCompile `
                   /p:Configuration=Release `
                   /p:Platform=x64 `
                   /p:BuildProjectReferences=false `
@@ -267,9 +295,14 @@ jobs:
                   /p:GenerateAppxPackageOnBuild=false `
                   /p:AppxPackageSigningEnabled=false `
                   /p:AppxBundle=Never `
-                  /bl:".\logs\quick-compile.binlog"
+                  /bl:".\logs\source-check.binlog"
+
+              if ($LASTEXITCODE -ne 0) {
+                  throw "XboxWine C++ source check failed with exit code $LASTEXITCODE."
+              }
           } else {
-              Write-Host "No exact cache yet. Running one full dependency build."
+              Write-Host "No reusable core libraries were found."
+              Write-Host "This run must build BoxedWine dependencies once."
 
               msbuild.exe $solution `
                   /m `
@@ -280,19 +313,19 @@ jobs:
                   /p:GenerateAppxPackageOnBuild=false `
                   /p:AppxPackageSigningEnabled=false `
                   /p:AppxBundle=Never `
-                  /bl:".\logs\full-compile.binlog"
+                  /bl:".\logs\first-core-build.binlog"
+
+              if ($LASTEXITCODE -ne 0) {
+                  throw "Initial BoxedWine dependency build failed with exit code $LASTEXITCODE."
+              }
           }
 
-          if ($LASTEXITCODE -ne 0) {
-              throw "Fast compile check failed with exit code $LASTEXITCODE."
-          }
-
-      - name: Save compiled BoxedWine cache
+      - name: Save compiled BoxedWine core cache
         if: steps.boxedwine-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: work/boxedwine
-          key: boxedwine-uwp-fast-v4-${{ hashFiles('apply-patch.ps1', 'patch/uwp/**') }}
+          key: boxedwine-core-uwpcompat-sdl2285-v1
 
       - name: Restore Wine runtime cache
         id: wine-runtime-cache
@@ -433,6 +466,68 @@ jobs:
 
           Write-Host "Created temporary package certificate for CN=danwo."
 
+      - name: Build known-good x86 smoke test
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $vswhere = Join-Path `
+              ${env:ProgramFiles(x86)} `
+              "Microsoft Visual Studio\Installer\vswhere.exe"
+
+          $installation = & $vswhere `
+              -latest `
+              -products * `
+              -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+              -property installationPath
+
+          if (-not $installation) {
+              throw "Visual Studio C++ installation was not found."
+          }
+
+          $developerCommand = Join-Path `
+              $installation `
+              "Common7\Tools\VsDevCmd.bat"
+
+          $outputFolder = Join-Path `
+              $env:GITHUB_WORKSPACE `
+              "artifacts\AppPackages\XboxWine-x86-SmokeTest"
+
+          New-Item -ItemType Directory -Force $outputFolder | Out-Null
+
+          $source = Join-Path `
+              $env:GITHUB_WORKSPACE `
+              "samples\x86_smoke_test.c"
+          $output = Join-Path `
+              $outputFolder `
+              "XboxWine-x86-SmokeTest.exe"
+
+          $compileCommand = (
+              'call "' + $developerCommand + '"' +
+              ' -no_logo -arch=x86 -host_arch=x64 && ' +
+              'cl.exe /nologo /O1 /MT "' + $source + '"' +
+              ' user32.lib /link /SUBSYSTEM:WINDOWS /MACHINE:X86' +
+              ' /OUT:"' + $output + '"'
+          )
+
+          cmd.exe /d /s /c $compileCommand
+
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $output)) {
+              throw "The x86 smoke test failed to compile."
+          }
+
+          @"
+          XboxWine x86 smoke test
+
+          Upload this entire folder with xboxwine_uploader.py.
+          A successful launch displays a Windows message box.
+          If this crashes too, collect a fresh Xbox crash dump.
+          "@ | Set-Content `
+              (Join-Path $outputFolder "README.txt") `
+              -Encoding UTF8
+
+          Get-Item $output | Select-Object FullName, Length
+
       - name: Create Xbox package
         shell: pwsh
         run: |
@@ -478,20 +573,20 @@ jobs:
           $bundle = Get-ChildItem `
               $packageFolder `
               -Recurse `
-              -Filter "*0.2.9.0*x64*.msixbundle" |
+              -Filter "*0.2.9.1*x64*.msixbundle" |
               Select-Object -First 1
 
           if (-not $bundle) {
-              throw "A v0.2.9.0 x64 MSIX bundle was not produced."
+              throw "A v0.2.9.1 x64 MSIX bundle was not produced."
           }
 
           @"
-          XboxWine Shelf v0.2.9.0
-          Fast cached build / Direct3D 11 / runtime manager
+          XboxWine Shelf v0.2.9.1
+          Cached core build / Direct3D 11 / x86 smoke test
           GitHub run: $env:GITHUB_RUN_NUMBER
           Commit: $env:GITHUB_SHA
           "@ | Set-Content `
-              (Join-Path $packageFolder "THIS-IS-XBOXWINE-v0.2.9.txt") `
+              (Join-Path $packageFolder "THIS-IS-XBOXWINE-v0.2.9.1.txt") `
               -Encoding UTF8
 
           Get-ChildItem $packageFolder -Recurse |
@@ -500,7 +595,7 @@ jobs:
       - name: Upload Xbox package
         uses: actions/upload-artifact@v7
         with:
-          name: XboxWine-Shelf-v0.2.9-x64
+          name: XboxWine-Shelf-v0.2.9.1-x64
           path: artifacts/AppPackages/
           if-no-files-found: error
           compression-level: 0

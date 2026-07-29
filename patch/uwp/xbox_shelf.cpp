@@ -12,6 +12,7 @@
 #include "SDL2/SDL.h"
 
 #include <winrt/base.h>
+#include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Storage.h>
 #include <winrt/Windows.UI.Core.h>
@@ -52,6 +53,7 @@ const std::vector<std::pair<std::string, std::string>> kControllerInputs{
 };
 
 std::atomic<bool> gSystemBackRequested{false};
+std::atomic<Uint32> gIgnoreBackUntil{0};
 SystemNavigationManager gSystemNavigationManager{nullptr};
 winrt::event_token gSystemBackToken{};
 bool gSystemBackHandlerInstalled = false;
@@ -65,8 +67,8 @@ void InstallSystemBackHandler() {
             SystemNavigationManager::GetForCurrentView();
         gSystemBackToken = gSystemNavigationManager.BackRequested(
             [](
-                const IInspectable&,
-                const BackRequestedEventArgs& arguments
+                winrt::Windows::Foundation::IInspectable const&,
+                winrt::Windows::UI::Core::BackRequestedEventArgs const& arguments
             ) {
                 arguments.Handled(true);
                 gSystemBackRequested.store(true);
@@ -78,18 +80,38 @@ void InstallSystemBackHandler() {
     }
 }
 
+bool BackInputAllowed() {
+    return SDL_GetTicks() >= gIgnoreBackUntil.load();
+}
+
 bool ConsumeSystemBackRequest() {
-    return gSystemBackRequested.exchange(false);
+    const bool requested = gSystemBackRequested.exchange(false);
+    return requested && BackInputAllowed();
+}
+
+bool IsBackEvent(const SDL_Event& event) {
+    if (!BackInputAllowed()) {
+        return false;
+    }
+
+    return (
+        event.type == SDL_KEYDOWN &&
+        event.key.keysym.sym == SDLK_ESCAPE
+    ) || (
+        event.type == SDL_CONTROLLERBUTTONDOWN &&
+        event.cbutton.button == SDL_CONTROLLER_BUTTON_B
+    );
 }
 
 void ClearBackInput() {
+    // Xbox can deliver the same B press through SDL and UWP BackRequested.
+    // Ignore the delayed duplicate after leaving a submenu.
+    gIgnoreBackUntil.store(SDL_GetTicks() + 650);
     gSystemBackRequested.store(false);
     SDL_FlushEvent(SDL_KEYDOWN);
     SDL_FlushEvent(SDL_KEYUP);
     SDL_FlushEvent(SDL_CONTROLLERBUTTONDOWN);
     SDL_FlushEvent(SDL_CONTROLLERBUTTONUP);
-    SDL_Delay(120);
-    gSystemBackRequested.store(false);
 }
 
 std::string Trim(const std::string& input) {
@@ -788,8 +810,7 @@ bool EditControls(
                     running = false;
                 }
             }
-            if ((event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_ESCAPE) ||
-                ControllerPressed(event, SDL_CONTROLLER_BUTTON_B)) {
+            if (IsBackEvent(event)) {
                 game.controller = original;
                 running = false;
             }
@@ -907,8 +928,7 @@ void ShowTransferScreen(SDL_Renderer* renderer) {
         }
         SDL_Event event{};
         while (running && SDL_PollEvent(&event)) {
-            if ((event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_ESCAPE) ||
-                ControllerPressed(event, SDL_CONTROLLER_BUTTON_B)) {
+            if (IsBackEvent(event)) {
                 running = false;
             }
         }
@@ -1169,9 +1189,7 @@ bool ShowRuntimeMenu(
                 running = false;
             }
 
-            if ((event.type == SDL_KEYDOWN &&
-                 event.key.keysym.sym == SDLK_ESCAPE) ||
-                ControllerPressed(event, SDL_CONTROLLER_BUTTON_B)) {
+            if (IsBackEvent(event)) {
                 running = false;
             }
         }
@@ -1343,10 +1361,7 @@ bool PickGame(GameEntry& selected, std::string& diagnostic) {
                  event.key.keysym.sym == SDLK_RETURN) ||
                 ControllerPressed(event, SDL_CONTROLLER_BUTTON_A);
 
-            const bool back =
-                (event.type == SDL_KEYDOWN &&
-                 event.key.keysym.sym == SDLK_ESCAPE) ||
-                ControllerPressed(event, SDL_CONTROLLER_BUTTON_B);
+            const bool back = IsBackEvent(event);
 
             if (screen == ShelfScreen::Home) {
                 if (up && canMove) {
