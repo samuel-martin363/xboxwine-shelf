@@ -23,7 +23,14 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: work/boxedwine
-          key: boxedwine-uwp-windows2022-x64-v1
+          key: boxedwine-uwp-windows2022-x64-official-sdl-v2
+
+      - name: Restore official SDL2 UWP cache
+        id: sdl2-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: work/sdl2-uwp
+          key: sdl2-uwp-release-2.28.5-v143-x64-v1
 
       - name: Enable MSBuild
         uses: microsoft/setup-msbuild@v2
@@ -75,6 +82,153 @@ jobs:
           "BOXEDWINE_ROOT=$repoRoot" |
               Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
+          $manifestPath = Join-Path `
+              $repoRoot `
+              "project\msvc\BoxedWine\uwp\Package.appxmanifest"
+
+          $manifestText = Get-Content -Raw $manifestPath
+          if (-not $manifestText.Contains('Version="0.2.7.0"')) {
+              throw "Manifest version verification failed. Expected 0.2.7.0."
+          }
+
+          Write-Host "Verified package identity version 0.2.7.0."
+
+      - name: Build official SDL2 UWP renderer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          New-Item -ItemType Directory -Force ".\logs" | Out-Null
+
+          $sdlWork = Join-Path $env:GITHUB_WORKSPACE "work\sdl2-uwp"
+          $sdlSource = Join-Path $sdlWork "source"
+          $builtDll = Join-Path $sdlWork "output\SDL2.dll"
+          $builtLib = Join-Path $sdlWork "output\SDL2.lib"
+          $builtInclude = Join-Path $sdlWork "include"
+
+          if (-not (Test-Path $builtDll) -or -not (Test-Path $builtLib)) {
+              Remove-Item $sdlWork -Recurse -Force -ErrorAction SilentlyContinue
+              New-Item -ItemType Directory -Force $sdlSource | Out-Null
+
+              $archive = Join-Path $env:RUNNER_TEMP "SDL2-2.28.5.zip"
+
+              curl.exe `
+                --fail `
+                --location `
+                --retry 5 `
+                --retry-all-errors `
+                "https://codeload.github.com/libsdl-org/SDL/zip/refs/tags/release-2.28.5" `
+                --output $archive
+
+              Expand-Archive -Path $archive -DestinationPath $sdlSource -Force
+
+              $sdlRoot = Get-ChildItem $sdlSource -Directory |
+                  Where-Object { $_.Name -like "SDL-*" } |
+                  Select-Object -First 1
+
+              if (-not $sdlRoot) {
+                  throw "Official SDL2 source folder was not found."
+              }
+
+              $sdlSolution = Get-ChildItem `
+                  $sdlRoot.FullName `
+                  -Recurse `
+                  -Filter "SDL-UWP.sln" |
+                  Where-Object {
+                      $_.FullName -like "*VisualC-WinRT*UWP_VS2015*"
+                  } |
+                  Select-Object -First 1
+
+              if (-not $sdlSolution) {
+                  throw "Official SDL2 UWP solution was not found."
+              }
+
+              msbuild.exe $sdlSolution.FullName `
+                  /m `
+                  /t:Build `
+                  /p:Configuration=Release `
+                  /p:Platform=x64 `
+                  /p:PlatformToolset=v143 `
+                  /p:WindowsTargetPlatformVersion=10.0.19041.0 `
+                  /bl:".\logs\sdl2.binlog"
+
+              if ($LASTEXITCODE -ne 0) {
+                  throw "Official SDL2 UWP build failed with exit code $LASTEXITCODE."
+              }
+
+              $dll = Get-ChildItem `
+                  $sdlRoot.FullName `
+                  -Recurse `
+                  -Filter "SDL2.dll" |
+                  Where-Object {
+                      $_.FullName -match "[\\/]x64[\\/]" -and
+                      $_.FullName -match "[\\/]Release[\\/]"
+                  } |
+                  Sort-Object Length -Descending |
+                  Select-Object -First 1
+
+              $lib = Get-ChildItem `
+                  $sdlRoot.FullName `
+                  -Recurse `
+                  -Filter "SDL2.lib" |
+                  Where-Object {
+                      $_.FullName -match "[\\/]x64[\\/]" -and
+                      $_.FullName -match "[\\/]Release[\\/]"
+                  } |
+                  Sort-Object Length -Descending |
+                  Select-Object -First 1
+
+              if (-not $dll -or -not $lib) {
+                  throw "Official SDL2 UWP DLL or import library was not produced."
+              }
+
+              New-Item `
+                  -ItemType Directory `
+                  -Force `
+                  (Split-Path $builtDll) | Out-Null
+              New-Item `
+                  -ItemType Directory `
+                  -Force `
+                  $builtInclude | Out-Null
+
+              Copy-Item $dll.FullName $builtDll -Force
+              Copy-Item $lib.FullName $builtLib -Force
+              Copy-Item `
+                  (Join-Path $sdlRoot.FullName "include\*.h") `
+                  $builtInclude `
+                  -Force
+          } else {
+              Write-Host "Reusing cached official SDL2 UWP build."
+          }
+
+          $deps = Join-Path `
+              $env:BOXEDWINE_ROOT `
+              "project\msvc\BoxedWine\deps"
+
+          New-Item -ItemType Directory -Force (Join-Path $deps "bin") | Out-Null
+          New-Item -ItemType Directory -Force (Join-Path $deps "lib") | Out-Null
+          New-Item -ItemType Directory -Force (Join-Path $deps "include\SDL2") | Out-Null
+
+          Copy-Item $builtDll (Join-Path $deps "bin\SDL2.dll") -Force
+          Copy-Item $builtLib (Join-Path $deps "lib\SDL2.lib") -Force
+          Copy-Item `
+              (Join-Path $builtInclude "*.h") `
+              (Join-Path $deps "include\SDL2") `
+              -Force
+
+          Write-Host "Replaced the crashing custom OpenGL SDL2.dll."
+          Get-Item `
+              (Join-Path $deps "bin\SDL2.dll"), `
+              (Join-Path $deps "lib\SDL2.lib") |
+              Select-Object FullName, Length, LastWriteTime
+
+      - name: Save official SDL2 UWP cache
+        if: steps.sdl2-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: work/sdl2-uwp
+          key: sdl2-uwp-release-2.28.5-v143-x64-v1
+
       - name: Compile XboxWine
         shell: pwsh
         run: |
@@ -106,7 +260,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: work/boxedwine
-          key: boxedwine-uwp-windows2022-x64-v1
+          key: boxedwine-uwp-windows2022-x64-official-sdl-v2
 
       - name: Restore Wine runtime cache
         id: wine-runtime-cache
@@ -287,13 +441,32 @@ jobs:
               (Join-Path $packageFolder "XboxWine-Shelf-TestCertificate.cer") `
               -Force
 
+          $bundle = Get-ChildItem `
+              $packageFolder `
+              -Recurse `
+              -Filter "*0.2.7.0*x64*.msixbundle" |
+              Select-Object -First 1
+
+          if (-not $bundle) {
+              throw "A v0.2.7.0 x64 MSIX bundle was not produced."
+          }
+
+          @"
+XboxWine Shelf v0.2.7.0
+Official SDL2 UWP / Direct3D 11 recovery build
+GitHub run: $env:GITHUB_RUN_NUMBER
+Commit: $env:GITHUB_SHA
+"@ | Set-Content `
+              (Join-Path $packageFolder "THIS-IS-XBOXWINE-v0.2.7.txt") `
+              -Encoding UTF8
+
           Get-ChildItem $packageFolder -Recurse |
               Select-Object FullName, Length
 
       - name: Upload Xbox package
         uses: actions/upload-artifact@v7
         with:
-          name: XboxWine-Shelf-x64
+          name: XboxWine-Shelf-v0.2.7-x64
           path: artifacts/AppPackages/
           if-no-files-found: error
           compression-level: 0

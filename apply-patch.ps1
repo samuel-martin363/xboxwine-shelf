@@ -189,22 +189,16 @@ $manifest = $manifest.Replace(
     'Description="16/32 bit app support for UWP bia Boxed Wine"',
     'Description="Local 16/32-bit Windows game shelf with network folder transfer"'
 )
-$manifest = $manifest.Replace(
-    'Version="1.0.0.0"',
-    'Version="0.2.5.0"'
+$manifest = [System.Text.RegularExpressions.Regex]::Replace(
+    $manifest,
+    '(<Identity\b[^>]*\bVersion=")[^"]+(")',
+    '${1}0.2.7.0${2}',
+    1
 )
-$manifest = $manifest.Replace(
-    'Version="0.1.0.0"',
-    'Version="0.2.5.0"'
-)
-$manifest = $manifest.Replace(
-    'Version="0.2.5.0"',
-    'Version="0.2.5.0"'
-)
-$manifest = $manifest.Replace(
-    'Version="0.2.5.0"',
-    'Version="0.2.5.0"'
-)
+
+if (-not $manifest.Contains('Version="0.2.7.0"')) {
+    throw "Failed to set Package.appxmanifest version to 0.2.7.0."
+}
 
 if (-not $manifest.Contains('Name="privateNetworkClientServer"')) {
     $manifest = $manifest.Replace(
@@ -219,5 +213,5 @@ if (-not $manifest.Contains('Name="privateNetworkClientServer"')) {
 
 Set-Content -Path $manifestPath -Value $manifest -Encoding UTF8
 
-Write-Host "Patched XboxWine Shelf v0.2.5 source and Visual Studio project." -ForegroundColor Green
+Write-Host "Patched XboxWine Shelf v0.2.7 source and Visual Studio project." -ForegroundColor Green
 Write-Host "Original files saved in: $backupDir"

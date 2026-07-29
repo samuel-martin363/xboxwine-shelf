@@ -896,13 +896,11 @@ std::map<std::string, std::string> DefaultControllerBindings() {
 }
 
 bool PickGame(GameEntry& selected, std::string& diagnostic) {
-    // Video and events are required. Controller initialization is optional so
-    // a controller-backend problem cannot kill the entire UI before it draws.
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) != 0) {
-        diagnostic = std::string("SDL INIT FAILED: ") + SDL_GetError();
+    SDL_SetHint(SDL_HINT_RENDER_DRIVER, "direct3d11");
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER | SDL_INIT_EVENTS) != 0) {
+        diagnostic = SDL_GetError();
         return false;
     }
-    SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER);
 
     SDL_Window* window = SDL_CreateWindow(
         "XboxWine Shelf",
@@ -910,34 +908,25 @@ bool PickGame(GameEntry& selected, std::string& diagnostic) {
         SDL_WINDOWPOS_CENTERED,
         1280,
         720,
-        SDL_WINDOW_SHOWN
+        SDL_WINDOW_FULLSCREEN_DESKTOP
     );
     if (!window) {
-        diagnostic = std::string("SDL WINDOW FAILED: ") + SDL_GetError();
+        diagnostic = SDL_GetError();
         return false;
     }
     SDL_Renderer* renderer = SDL_CreateRenderer(
         window,
         -1,
-        SDL_RENDERER_ACCELERATED
+        SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC
     );
-    if (!renderer) {
-        renderer = SDL_CreateRenderer(window, -1, 0);
-    }
     if (!renderer) {
         renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
     }
     if (!renderer) {
-        diagnostic = std::string("SDL RENDERER FAILED: ") + SDL_GetError();
+        diagnostic = SDL_GetError();
         SDL_DestroyWindow(window);
         return false;
     }
-
-    // Present a visible frame before storage/network initialization. If this
-    // stays onscreen, SDL is healthy and a later subsystem is the problem.
-    SDL_SetRenderDrawColor(renderer, 10, 14, 22, 255);
-    SDL_RenderClear(renderer);
-    SDL_RenderPresent(renderer);
 
     SDL_GameController* menuController = nullptr;
     for (int index = 0; index < SDL_NumJoysticks(); ++index) {

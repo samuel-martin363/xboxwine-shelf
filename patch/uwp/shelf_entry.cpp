@@ -1,85 +1,54 @@
 /*
- * XboxWine minimal software-surface boot probe
- * Temporary diagnostic build
+ * XboxWine Shelf entry point
  * GPL-2.0-or-later
  */
 
 #define SDL_MAIN_HANDLED
 #include "SDL2/SDL.h"
 
+#include "controller_bridge.h"
+#include "xbox_shelf.h"
+
+#include <exception>
+#include <string>
+#include <vector>
+
+extern int boxedmain(int argc, const char** argv);
+
 extern "C" int SDL_main(int, char**) {
-    // Prevent SDL from selecting the crashing OpenGL renderer.
-    SDL_SetHint(SDL_HINT_RENDER_DRIVER, "software");
+    xboxwine::GameEntry selected;
+    std::string diagnostic;
 
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) != 0) {
-        SDL_Delay(120000);
-        return 10;
+    if (!xboxwine::PickGame(selected, diagnostic)) {
+        return 0;
     }
 
-    SDL_Window* window = SDL_CreateWindow(
-        "XboxWine Software Probe",
-        SDL_WINDOWPOS_CENTERED,
-        SDL_WINDOWPOS_CENTERED,
-        1280,
-        720,
-        SDL_WINDOW_FULLSCREEN_DESKTOP
-    );
+    xboxwine::InstallControllerBridge(selected.controller);
 
-    if (!window) {
-        SDL_Delay(120000);
-        SDL_Quit();
-        return 20;
+    std::vector<std::string> owned = xboxwine::BuildBoxedWineArguments(selected);
+    std::vector<const char*> raw;
+    raw.reserve(owned.size());
+    for (const std::string& value : owned) {
+        raw.push_back(value.c_str());
     }
 
-    // Do not call SDL_CreateRenderer here. The crash dump proved that the
-    // bundled SDL library enters a broken OpenGL context path from there.
-    SDL_Surface* surface = SDL_GetWindowSurface(window);
-
-    if (surface) {
-        const Uint32 green = SDL_MapRGB(
-            surface->format,
-            20,
-            180,
-            70
+    try {
+        return boxedmain(static_cast<int>(raw.size()), raw.data());
+    } catch (const std::exception& error) {
+        SDL_ShowSimpleMessageBox(
+            SDL_MESSAGEBOX_ERROR,
+            "XboxWine Shelf",
+            error.what(),
+            nullptr
         );
-
-        SDL_FillRect(surface, nullptr, green);
-        SDL_UpdateWindowSurface(window);
+        return 1;
+    } catch (...) {
+        SDL_ShowSimpleMessageBox(
+            SDL_MESSAGEBOX_ERROR,
+            "XboxWine Shelf",
+            "BoxedWine stopped because of an unknown exception.",
+            nullptr
+        );
+        return 1;
     }
-
-    bool running = true;
-    while (running) {
-        SDL_Event event{};
-
-        while (SDL_PollEvent(&event)) {
-            if (event.type == SDL_QUIT) {
-                running = false;
-            }
-
-            if (
-                event.type == SDL_KEYDOWN &&
-                event.key.keysym.sym == SDLK_ESCAPE
-            ) {
-                running = false;
-            }
-        }
-
-        if (surface) {
-            const Uint32 green = SDL_MapRGB(
-                surface->format,
-                20,
-                180,
-                70
-            );
-
-            SDL_FillRect(surface, nullptr, green);
-            SDL_UpdateWindowSurface(window);
-        }
-
-        SDL_Delay(16);
-    }
-
-    SDL_DestroyWindow(window);
-    SDL_Quit();
-    return 0;
 }
