@@ -36,61 +36,113 @@ foreach ($file in @(
     Copy-Item (Join-Path $patchDir $file) $uwpDir -Force
 }
 
-$project = Get-Content -Raw -Path $projectPath
+# Edit the Visual C++ project as XML instead of matching a multiline string.
+# This is resilient to LF/CRLF and harmless whitespace changes in the fork.
+[xml]$projectXml = Get-Content -Raw -Path $projectPath
+$namespaceUri = $projectXml.Project.NamespaceURI
 
-$oldCompileGroup = @'
-  <ItemGroup>
-    <ClCompile Include="main.cpp" />
-  </ItemGroup>
-'@
+$namespaceManager = New-Object System.Xml.XmlNamespaceManager($projectXml.NameTable)
+$namespaceManager.AddNamespace("msb", $namespaceUri)
 
-$newCompileGroup = @'
-  <ItemGroup>
-    <ClCompile Include="main.cpp" />
-    <ClCompile Include="shelf_entry.cpp" />
-    <ClCompile Include="xbox_shelf.cpp" />
-    <ClCompile Include="controller_bridge.cpp" />
-    <ClCompile Include="transfer_server.cpp" />
-  </ItemGroup>
-  <ItemGroup>
-    <ClInclude Include="xbox_shelf.h" />
-    <ClInclude Include="controller_bridge.h" />
-    <ClInclude Include="transfer_server.h" />
-  </ItemGroup>
-'@
-
-if ($project.Contains($oldCompileGroup)) {
-    $project = $project.Replace($oldCompileGroup, $newCompileGroup)
+$projectNode = $projectXml.SelectSingleNode("/msb:Project", $namespaceManager)
+if (-not $projectNode) {
+    throw "Could not read the root Project element from uwp.vcxproj."
 }
-elseif (-not $project.Contains('ClCompile Include="shelf_entry.cpp"')) {
-    throw "Could not locate the expected main.cpp ItemGroup in uwp.vcxproj."
+
+$targetsImport = $projectXml.SelectSingleNode(
+    '/msb:Project/msb:Import[@Project="$(VCTargetsPath)\Microsoft.Cpp.targets"]',
+    $namespaceManager
+)
+if (-not $targetsImport) {
+    throw "Could not locate Microsoft.Cpp.targets in uwp.vcxproj."
 }
-elseif (-not $project.Contains('ClCompile Include="transfer_server.cpp"')) {
-    $project = $project.Replace(
-        '    <ClCompile Include="controller_bridge.cpp" />',
-        "    <ClCompile Include=`"controller_bridge.cpp`" />`r`n    <ClCompile Include=`"transfer_server.cpp`" />"
+
+function Find-ProjectItem {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ElementName,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Include
     )
-    $project = $project.Replace(
-        '    <ClInclude Include="controller_bridge.h" />',
-        "    <ClInclude Include=`"controller_bridge.h`" />`r`n    <ClInclude Include=`"transfer_server.h`" />"
-    )
+
+    foreach ($node in $projectXml.SelectNodes("//msb:$ElementName", $namespaceManager)) {
+        if ($node.GetAttribute("Include") -eq $Include) {
+            return $node
+        }
+    }
+
+    return $null
 }
 
-if (-not $project.Contains('$(ProjectDir)*Wine*.zip')) {
-    $project = $project.Replace(
-        '  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />',
-        @'
-  <ItemGroup>
-    <Content Include="$(ProjectDir)*Wine*.zip">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-    </Content>
-  </ItemGroup>
-  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
-'@
-    )
+function New-ItemGroupBeforeTargets {
+    $group = $projectXml.CreateElement("ItemGroup", $namespaceUri)
+    [void]$projectNode.InsertBefore($group, $targetsImport)
+    return $group
 }
 
-Set-Content -Path $projectPath -Value $project -Encoding UTF8
+$mainCompile = Find-ProjectItem -ElementName "ClCompile" -Include "main.cpp"
+if (-not $mainCompile) {
+    throw "Could not locate main.cpp in uwp.vcxproj."
+}
+
+$compileGroup = $mainCompile.ParentNode
+foreach ($file in @(
+    "shelf_entry.cpp",
+    "xbox_shelf.cpp",
+    "controller_bridge.cpp",
+    "transfer_server.cpp"
+)) {
+    if (-not (Find-ProjectItem -ElementName "ClCompile" -Include $file)) {
+        $node = $projectXml.CreateElement("ClCompile", $namespaceUri)
+        $node.SetAttribute("Include", $file)
+        [void]$compileGroup.AppendChild($node)
+    }
+}
+
+$includeGroup = $null
+$existingInclude = $projectXml.SelectSingleNode("//msb:ClInclude", $namespaceManager)
+if ($existingInclude) {
+    $includeGroup = $existingInclude.ParentNode
+} else {
+    $includeGroup = New-ItemGroupBeforeTargets
+}
+
+foreach ($file in @(
+    "xbox_shelf.h",
+    "controller_bridge.h",
+    "transfer_server.h"
+)) {
+    if (-not (Find-ProjectItem -ElementName "ClInclude" -Include $file)) {
+        $node = $projectXml.CreateElement("ClInclude", $namespaceUri)
+        $node.SetAttribute("Include", $file)
+        [void]$includeGroup.AppendChild($node)
+    }
+}
+
+$runtimeInclude = '$(ProjectDir)*Wine*.zip'
+if (-not (Find-ProjectItem -ElementName "Content" -Include $runtimeInclude)) {
+    $contentGroup = New-ItemGroupBeforeTargets
+    $content = $projectXml.CreateElement("Content", $namespaceUri)
+    $content.SetAttribute("Include", $runtimeInclude)
+
+    $copy = $projectXml.CreateElement("CopyToOutputDirectory", $namespaceUri)
+    $copy.InnerText = "PreserveNewest"
+    [void]$content.AppendChild($copy)
+    [void]$contentGroup.AppendChild($content)
+}
+
+$writerSettings = New-Object System.Xml.XmlWriterSettings
+$writerSettings.Indent = $true
+$writerSettings.Encoding = New-Object System.Text.UTF8Encoding($false)
+
+$writer = [System.Xml.XmlWriter]::Create($projectPath, $writerSettings)
+try {
+    $projectXml.Save($writer)
+}
+finally {
+    $writer.Dispose()
+}
 
 $manifest = Get-Content -Raw -Path $manifestPath
 $manifest = $manifest.Replace(
@@ -107,11 +159,15 @@ $manifest = $manifest.Replace(
 )
 $manifest = $manifest.Replace(
     'Version="1.0.0.0"',
-    'Version="0.2.0.0"'
+    'Version="0.2.1.0"'
 )
 $manifest = $manifest.Replace(
     'Version="0.1.0.0"',
-    'Version="0.2.0.0"'
+    'Version="0.2.1.0"'
+)
+$manifest = $manifest.Replace(
+    'Version="0.2.0.0"',
+    'Version="0.2.1.0"'
 )
 
 if (-not $manifest.Contains('Name="privateNetworkClientServer"')) {
@@ -127,5 +183,5 @@ if (-not $manifest.Contains('Name="privateNetworkClientServer"')) {
 
 Set-Content -Path $manifestPath -Value $manifest -Encoding UTF8
 
-Write-Host "Patched XboxWine Shelf v0.2 source and Visual Studio project." -ForegroundColor Green
+Write-Host "Patched XboxWine Shelf v0.2.1 source and Visual Studio project." -ForegroundColor Green
 Write-Host "Original files saved in: $backupDir"
