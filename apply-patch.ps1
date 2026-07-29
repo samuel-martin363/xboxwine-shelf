@@ -191,19 +191,19 @@ $manifest = $manifest.Replace(
 )
 $manifest = $manifest.Replace(
     'Version="1.0.0.0"',
-    'Version="0.2.4.0"'
+    'Version="0.2.5.0"'
 )
 $manifest = $manifest.Replace(
     'Version="0.1.0.0"',
-    'Version="0.2.4.0"'
+    'Version="0.2.5.0"'
 )
 $manifest = $manifest.Replace(
-    'Version="0.2.4.0"',
-    'Version="0.2.4.0"'
+    'Version="0.2.5.0"',
+    'Version="0.2.5.0"'
 )
 $manifest = $manifest.Replace(
-    'Version="0.2.4.0"',
-    'Version="0.2.4.0"'
+    'Version="0.2.5.0"',
+    'Version="0.2.5.0"'
 )
 
 if (-not $manifest.Contains('Name="privateNetworkClientServer"')) {
@@ -219,5 +219,5 @@ if (-not $manifest.Contains('Name="privateNetworkClientServer"')) {
 
 Set-Content -Path $manifestPath -Value $manifest -Encoding UTF8
 
-Write-Host "Patched XboxWine Shelf v0.2.4 source and Visual Studio project." -ForegroundColor Green
+Write-Host "Patched XboxWine Shelf v0.2.5 source and Visual Studio project." -ForegroundColor Green
 Write-Host "Original files saved in: $backupDir"
