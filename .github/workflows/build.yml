@@ -130,20 +130,27 @@ jobs:
                   throw "Official SDL2 source folder was not found."
               }
 
-              $sdlSolution = Get-ChildItem `
+              $sdlSolution = Join-Path `
                   $sdlRoot.FullName `
-                  -Recurse `
-                  -Filter "SDL-UWP.sln" |
-                  Where-Object {
-                      $_.FullName -like "*VisualC-WinRT*UWP_VS2015*"
-                  } |
-                  Select-Object -First 1
+                  "VisualC-WinRT\SDL-UWP.sln"
 
-              if (-not $sdlSolution) {
-                  throw "Official SDL2 UWP solution was not found."
+              if (-not (Test-Path $sdlSolution)) {
+                  Write-Host "SDL source root contents:"
+                  Get-ChildItem $sdlRoot.FullName |
+                      Select-Object Name, FullName
+
+                  Write-Host "VisualC-WinRT contents:"
+                  Get-ChildItem `
+                      (Join-Path $sdlRoot.FullName "VisualC-WinRT") `
+                      -ErrorAction SilentlyContinue |
+                      Select-Object Name, FullName
+
+                  throw "Official SDL2 UWP solution was not found at $sdlSolution."
               }
 
-              msbuild.exe $sdlSolution.FullName `
+              Write-Host "Using SDL UWP solution: $sdlSolution"
+
+              msbuild.exe $sdlSolution `
                   /m `
                   /t:Build `
                   /p:Configuration=Release `
