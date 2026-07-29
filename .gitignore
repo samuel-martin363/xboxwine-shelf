@@ -1,0 +1,8 @@
+﻿work/
+*.zip
+*.part
+.vs/
+__pycache__/
+*.pyc
+logs/
+artifacts/

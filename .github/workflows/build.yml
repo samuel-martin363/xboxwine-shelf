@@ -1,0 +1,194 @@
+﻿name: Build XboxWine Shelf
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out XboxWine Shelf
+        uses: actions/checkout@v6
+
+      - name: Enable MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Download and patch BoxedWine UWP
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $archive = Join-Path $env:RUNNER_TEMP "boxedwine-uwp.zip"
+          $extract = Join-Path $env:GITHUB_WORKSPACE "work\source"
+          $repoRoot = Join-Path $env:GITHUB_WORKSPACE "work\boxedwine"
+
+          New-Item -ItemType Directory -Force $extract | Out-Null
+
+          curl.exe `
+            --fail `
+            --location `
+            --retry 5 `
+            --retry-all-errors `
+            "https://codeload.github.com/worleydl/Boxedwine-uwp/zip/refs/heads/uwp-compat" `
+            --output $archive
+
+          Expand-Archive -Path $archive -DestinationPath $extract -Force
+
+          $downloaded = Get-ChildItem $extract -Directory |
+              Where-Object { $_.Name -like "Boxedwine-uwp-*" } |
+              Select-Object -First 1
+
+          if (-not $downloaded) {
+              throw "Downloaded BoxedWine folder was not found."
+          }
+
+          if (Test-Path $repoRoot) {
+              Remove-Item $repoRoot -Recurse -Force
+          }
+
+          Move-Item $downloaded.FullName $repoRoot
+
+          .\apply-patch.ps1 -RepoRoot $repoRoot
+
+          "BOXEDWINE_ROOT=$repoRoot" |
+              Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Compile XboxWine
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          New-Item -ItemType Directory -Force ".\logs" | Out-Null
+
+          $solution = Join-Path `
+              $env:BOXEDWINE_ROOT `
+              "project\msvc\BoxedWine\BoxedWine.sln"
+
+          msbuild.exe $solution `
+              /m `
+              /restore `
+              /t:Build `
+              /p:Configuration=Release `
+              /p:Platform=x64 `
+              /bl:".\logs\compile.binlog"
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Compilation failed with exit code $LASTEXITCODE."
+          }
+
+      - name: Download Wine runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          choco install wget -y --no-progress
+
+          $uwpFolder = Join-Path `
+              $env:BOXEDWINE_ROOT `
+              "project\msvc\BoxedWine\uwp"
+
+          $destination = Join-Path $uwpFolder "Debian10-Wine-5.0.zip"
+          $temporary = "$destination.part"
+
+          $baseUrl = "https://sourceforge.net/projects/boxedwine/files/FileSystems/Full/v5/Debian10-Wine-5.0.zip/download"
+
+          $mirrors = @(
+              "pilotfiber",
+              "phoenixnap",
+              "netix",
+              "cfhcable",
+              "psychz"
+          )
+
+          $downloaded = $false
+
+          foreach ($mirror in $mirrors) {
+              Write-Host "Trying SourceForge mirror: $mirror"
+
+              Remove-Item $temporary -Force -ErrorAction SilentlyContinue
+
+              & wget.exe `
+                  --tries=3 `
+                  --timeout=30 `
+                  --user-agent="Wget/1.21.4" `
+                  --output-document=$temporary `
+                  "$baseUrl?use_mirror=$mirror"
+
+              if (
+                  $LASTEXITCODE -eq 0 -and
+                  (Test-Path $temporary) -and
+                  (Get-Item $temporary).Length -gt 100MB
+              ) {
+                  & tar.exe -tf $temporary *> $null
+
+                  if ($LASTEXITCODE -eq 0) {
+                      Move-Item $temporary $destination -Force
+                      $downloaded = $true
+                      break
+                  }
+              }
+          }
+
+          if (-not $downloaded) {
+              throw "Every SourceForge runtime download attempt failed."
+          }
+
+          Get-Item $destination | Select-Object FullName, Length
+
+      - name: Create Xbox package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $project = Join-Path `
+              $env:BOXEDWINE_ROOT `
+              "project\msvc\BoxedWine\uwp\uwp.vcxproj"
+
+          $packageFolder = Join-Path `
+              $env:GITHUB_WORKSPACE `
+              "artifacts\AppPackages"
+
+          New-Item -ItemType Directory -Force $packageFolder | Out-Null
+
+          msbuild.exe $project `
+              /m `
+              /t:Rebuild `
+              /p:Configuration=Release `
+              /p:Platform=x64 `
+              /p:GenerateAppxPackageOnBuild=true `
+              /p:UapAppxPackageBuildMode=SideloadOnly `
+              /p:AppxBundle=Always `
+              /p:AppxBundlePlatforms=x64 `
+              "/p:AppxPackageDir=$packageFolder\" `
+              /bl:".\logs\package.binlog"
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Package creation failed with exit code $LASTEXITCODE."
+          }
+
+          Get-ChildItem $packageFolder -Recurse |
+              Select-Object FullName, Length
+
+      - name: Upload Xbox package
+        uses: actions/upload-artifact@v7
+        with:
+          name: XboxWine-Shelf-x64
+          path: artifacts/AppPackages/
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Upload diagnostic logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: XboxWine-Build-Logs
+          path: logs/
+          if-no-files-found: ignore
