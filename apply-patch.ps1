@@ -36,6 +36,38 @@ foreach ($file in @(
     Copy-Item (Join-Path $patchDir $file) $uwpDir -Force
 }
 
+# The BoxedWine static library supplies its own desktop-style main().
+# SDL rewrites that symbol to SDL_main, which conflicts with our custom
+# controller-first SDL_main in shelf_entry.cpp. Rename the unused standalone
+# entry point for this Xbox/UWP build so shelf_entry.cpp is the sole SDL_main.
+$nativeSystemPath = Join-Path $RepoRoot "platform\sdl\knativesystem.cpp"
+if (-not (Test-Path $nativeSystemPath)) {
+    throw "Could not locate BoxedWine platform entry source: $nativeSystemPath"
+}
+
+$nativeSystem = [System.IO.File]::ReadAllText($nativeSystemPath)
+$mainPattern = 'int\s+main\s*\(\s*int\s+argc\s*,\s*char\s*\*\*\s*argv\s*\)\s*\{'
+
+if ($nativeSystem -match $mainPattern) {
+    $nativeSystem = [System.Text.RegularExpressions.Regex]::Replace(
+        $nativeSystem,
+        $mainPattern,
+        'int boxedwine_standalone_main_disabled(int argc, char** argv) {',
+        1
+    )
+
+    [System.IO.File]::WriteAllText(
+        $nativeSystemPath,
+        $nativeSystem,
+        [System.Text.UTF8Encoding]::new($false)
+    )
+
+    Write-Host "Disabled BoxedWine's duplicate standalone SDL_main." -ForegroundColor Green
+}
+elseif (-not $nativeSystem.Contains("boxedwine_standalone_main_disabled")) {
+    throw "Could not locate BoxedWine's standalone main() in knativesystem.cpp."
+}
+
 # Edit the Visual C++ project as XML instead of matching a multiline string.
 # This is resilient to LF/CRLF and harmless whitespace changes in the fork.
 [xml]$projectXml = Get-Content -Raw -Path $projectPath
@@ -159,15 +191,19 @@ $manifest = $manifest.Replace(
 )
 $manifest = $manifest.Replace(
     'Version="1.0.0.0"',
-    'Version="0.2.1.0"'
+    'Version="0.2.2.0"'
 )
 $manifest = $manifest.Replace(
     'Version="0.1.0.0"',
-    'Version="0.2.1.0"'
+    'Version="0.2.2.0"'
 )
 $manifest = $manifest.Replace(
     'Version="0.2.0.0"',
-    'Version="0.2.1.0"'
+    'Version="0.2.2.0"'
+)
+$manifest = $manifest.Replace(
+    'Version="0.2.1.0"',
+    'Version="0.2.2.0"'
 )
 
 if (-not $manifest.Contains('Name="privateNetworkClientServer"')) {
@@ -183,5 +219,5 @@ if (-not $manifest.Contains('Name="privateNetworkClientServer"')) {
 
 Set-Content -Path $manifestPath -Value $manifest -Encoding UTF8
 
-Write-Host "Patched XboxWine Shelf v0.2.1 source and Visual Studio project." -ForegroundColor Green
+Write-Host "Patched XboxWine Shelf v0.2.2 source and Visual Studio project." -ForegroundColor Green
 Write-Host "Original files saved in: $backupDir"
