@@ -68,6 +68,105 @@ elseif (-not $nativeSystem.Contains("boxedwine_standalone_main_disabled")) {
     throw "Could not locate BoxedWine's standalone main() in knativesystem.cpp."
 }
 
+
+# XboxWine launch crash fix:
+# The experimental UWP fork calls resetContext() while creating the first
+# BoxedWine window. XboxWine launches boxedmain() directly and never creates
+# BoxedWine's ImGui UI context, so resetContext() reaches
+# ImGui::DestroyContext(nullptr) -> ImGui::Shutdown(nullptr) and crashes.
+$nativeScreenPath = Join-Path $RepoRoot "platform\sdl\knativescreenSDL.cpp"
+if (-not (Test-Path $nativeScreenPath)) {
+    throw "Could not locate BoxedWine screen source: $nativeScreenPath"
+}
+
+$nativeScreen = [System.IO.File]::ReadAllText($nativeScreenPath)
+$launchFixMarker = "XBOXWINE: skip resetContext without BoxedWine ImGui UI"
+
+if (-not $nativeScreen.Contains($launchFixMarker)) {
+    $resetPattern = '(?m)^(?<indent>[ \t]*)resetContext\(\);[^\r\n]*$'
+    $resetMatch = [System.Text.RegularExpressions.Regex]::Match(
+        $nativeScreen,
+        $resetPattern
+    )
+
+    if (-not $resetMatch.Success) {
+        throw "Could not locate resetContext() in KNativeScreenSDL::recreateMainWindow()."
+    }
+
+    $indent = $resetMatch.Groups["indent"].Value
+    $replacement = @(
+        "${indent}#if !defined(BOXEDWINE_UWP)",
+        "${indent}resetContext();",
+        "${indent}#else",
+        "${indent}// XBOXWINE: skip resetContext without BoxedWine ImGui UI",
+        "${indent}#endif"
+    ) -join [Environment]::NewLine
+
+    $nativeScreen = $nativeScreen.Remove(
+        $resetMatch.Index,
+        $resetMatch.Length
+    ).Insert(
+        $resetMatch.Index,
+        $replacement
+    )
+}
+
+# Also clean up SDL objects in dependency order and clear their pointers.
+# This prevents stale renderer/window/texture pointers during later recreation.
+$destroyPattern = '(?s)(?<indent>[ \t]*)if\s*\(\s*renderer\s*\)\s*\{\s*SDL_DestroyRenderer\s*\(\s*renderer\s*\)\s*;\s*\}\s*if\s*\(\s*window\s*\)\s*\{\s*SDL_DestroyWindow\s*\(\s*window\s*\)\s*;\s*\}\s*#ifdef\s+BOXEDWINE_UWP\s*if\s*\(\s*this->cursorTexture\s*\)\s*\{\s*SDL_DestroyTexture\s*\(\s*this->cursorTexture\s*\)\s*;\s*\}\s*#endif'
+$destroyFixMarker = "XBOXWINE: clear SDL object pointers after destruction"
+
+if (-not $nativeScreen.Contains($destroyFixMarker)) {
+    $destroyMatch = [System.Text.RegularExpressions.Regex]::Match(
+        $nativeScreen,
+        $destroyPattern
+    )
+
+    if ($destroyMatch.Success) {
+        $indent = $destroyMatch.Groups["indent"].Value
+        $destroyReplacement = @(
+            "${indent}#ifdef BOXEDWINE_UWP",
+            "${indent}if (this->cursorTexture) {",
+            "${indent}    SDL_DestroyTexture(this->cursorTexture);",
+            "${indent}    this->cursorTexture = nullptr;",
+            "${indent}}",
+            "${indent}#endif",
+            "${indent}if (renderer) {",
+            "${indent}    SDL_DestroyRenderer(renderer);",
+            "${indent}    renderer = nullptr;",
+            "${indent}}",
+            "${indent}if (window) {",
+            "${indent}    SDL_DestroyWindow(window);",
+            "${indent}    window = nullptr;",
+            "${indent}}",
+            "${indent}// XBOXWINE: clear SDL object pointers after destruction"
+        ) -join [Environment]::NewLine
+
+        $nativeScreen = $nativeScreen.Remove(
+            $destroyMatch.Index,
+            $destroyMatch.Length
+        ).Insert(
+            $destroyMatch.Index,
+            $destroyReplacement
+        )
+    }
+    else {
+        Write-Warning "The optional SDL pointer-cleanup block was not found. Continuing with the required ImGui launch fix."
+    }
+}
+
+if (-not $nativeScreen.Contains($launchFixMarker)) {
+    throw "The BoxedWine ImGui launch-crash fix was not applied."
+}
+
+[System.IO.File]::WriteAllText(
+    $nativeScreenPath,
+    $nativeScreen,
+    [System.Text.UTF8Encoding]::new($false)
+)
+
+Write-Host "Patched BoxedWine's null ImGui-context launch crash." -ForegroundColor Green
+
 # Edit the Visual C++ project as XML instead of matching a multiline string.
 # This is resilient to LF/CRLF and harmless whitespace changes in the fork.
 [xml]$projectXml = Get-Content -Raw -Path $projectPath
@@ -192,12 +291,12 @@ $manifest = $manifest.Replace(
 $manifest = [System.Text.RegularExpressions.Regex]::Replace(
     $manifest,
     '(<Identity\b[^>]*\bVersion=")[^"]+(")',
-    '${1}0.2.9.1${2}',
+    '${1}0.2.9.2${2}',
     1
 )
 
-if (-not $manifest.Contains('Version="0.2.9.1"')) {
-    throw "Failed to set Package.appxmanifest version to 0.2.9.1."
+if (-not $manifest.Contains('Version="0.2.9.2"')) {
+    throw "Failed to set Package.appxmanifest version to 0.2.9.2."
 }
 
 if (-not $manifest.Contains('Name="privateNetworkClientServer"')) {
@@ -213,5 +312,5 @@ if (-not $manifest.Contains('Name="privateNetworkClientServer"')) {
 
 Set-Content -Path $manifestPath -Value $manifest -Encoding UTF8
 
-Write-Host "Patched XboxWine Shelf v0.2.9.1 source and Visual Studio project." -ForegroundColor Green
+Write-Host "Patched XboxWine Shelf v0.2.9.2 launch-fix source and Visual Studio project." -ForegroundColor Green
 Write-Host "Original files saved in: $backupDir"
